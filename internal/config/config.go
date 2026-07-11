@@ -35,6 +35,7 @@ type Config struct {
 	ClientIdentifier       string
 	TokenAuth              string
 	TLSInsecureSkipVerify  bool
+	StreamCompression      string
 	ProxyURL               string
 	NoProxy                []string
 	APIKeys                []string
@@ -88,6 +89,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	streamCompression := strings.ToLower(strings.TrimSpace(env("GROK_STREAM_COMPRESSION", "identity")))
+	if streamCompression != "identity" && streamCompression != "gzip" {
+		return Config{}, fmt.Errorf("GROK_STREAM_COMPRESSION must be identity or gzip")
+	}
 	cfg := Config{
 		Host:                   env("GROK2API_HOST", "0.0.0.0"),
 		Port:                   port,
@@ -111,6 +116,7 @@ func Load() (Config, error) {
 		ClientIdentifier:       env("GROK_CLIENT_IDENTIFIER", "grok-shell"),
 		TokenAuth:              env("GROK_TOKEN_AUTH", "xai-grok-cli"),
 		TLSInsecureSkipVerify:  envBool("GROK_TLS_INSECURE_SKIP_VERIFY", false),
+		StreamCompression:      streamCompression,
 		ProxyURL:               strings.TrimSpace(os.Getenv("GROK_PROXY_URL")),
 		NoProxy:                splitCSV(os.Getenv("GROK_NO_PROXY")),
 	}

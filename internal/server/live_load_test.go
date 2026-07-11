@@ -151,6 +151,26 @@ func TestLiveGenerationLoad(t *testing.T) {
 	concurrency := positiveEnvInt(t, "GROK_LOAD_CONCURRENCY", 4)
 	total := positiveEnvInt(t, "GROK_LOAD_REQUESTS", concurrency*4)
 	stream := os.Getenv("GROK_LOAD_STREAM") == "1"
+	warmup := nonNegativeEnvInt(t, "GROK_LOAD_WARMUP", concurrency)
+	inputBytes := nonNegativeEnvInt(t, "GROK_LOAD_INPUT_BYTES", 0)
+	affinityMode := strings.ToLower(strings.TrimSpace(os.Getenv("GROK_LOAD_AFFINITY")))
+	if affinityMode == "" {
+		affinityMode = "session"
+	}
+	if affinityMode != "none" && affinityMode != "session" && affinityMode != "cache" {
+		t.Fatal("GROK_LOAD_AFFINITY must be none, session, or cache")
+	}
+	api := strings.ToLower(strings.TrimSpace(os.Getenv("GROK_LOAD_API")))
+	if api == "" {
+		api = "responses"
+	}
+	if api != "responses" && api != "chat" && api != "anthropic" {
+		t.Fatal("GROK_LOAD_API must be responses, chat, or anthropic")
+	}
+	streamCompression := strings.ToLower(strings.TrimSpace(os.Getenv("GROK_STREAM_COMPRESSION")))
+	if streamCompression == "" {
+		streamCompression = "identity"
+	}
 	timeout := durationEnv(t, "GROK_LOAD_TIMEOUT", 90*time.Second)
 	authsDir := os.Getenv("GROK_AUTHS_DIR")
 	if authsDir == "" {
@@ -165,7 +185,7 @@ func TestLiveGenerationLoad(t *testing.T) {
 		RateLimitCooldown: time.Minute, QuotaCooldown: 24 * time.Hour,
 		AffinityTTL: time.Hour, AffinityMaxEntries: 100000,
 		ClientName: "grok-shell", ClientVersion: "0.2.93", ClientSurface: "tui",
-		ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
+		ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli", StreamCompression: streamCompression,
 	}
 	s, err := New(cfg)
 	if err != nil {
@@ -181,12 +201,42 @@ func TestLiveGenerationLoad(t *testing.T) {
 	client := &http.Client{Transport: transport}
 	defer transport.CloseIdleConnections()
 
-	payload, err := json.Marshal(map[string]any{
-		"model": model, "input": "Reply with exactly OK.", "max_output_tokens": 8,
-		"stream": stream, "store": false,
-	})
+	prompt := "Reply with exactly OK."
+	if inputBytes > len(prompt) {
+		prompt = strings.Repeat("x", inputBytes-len(prompt)-1) + "\n" + prompt
+	}
+	path := "/v1/responses"
+	requestBody := map[string]any{"model": model, "stream": stream}
+	switch api {
+	case "chat":
+		path = "/v1/chat/completions"
+		requestBody["messages"] = []any{map[string]any{"role": "user", "content": prompt}}
+		requestBody["max_tokens"] = 8
+	case "anthropic":
+		path = "/v1/messages"
+		requestBody["messages"] = []any{map[string]any{"role": "user", "content": prompt}}
+		requestBody["max_tokens"] = 8
+	default:
+		requestBody["input"] = prompt
+		requestBody["max_output_tokens"] = 8
+		requestBody["store"] = false
+	}
+	if affinityMode == "cache" {
+		if api == "anthropic" {
+			requestBody["metadata"] = map[string]any{"user_id": "grok-live-load"}
+		} else {
+			requestBody["prompt_cache_key"] = "grok-live-load"
+		}
+	}
+	payload, err := json.Marshal(requestBody)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for index := 0; index < warmup; index++ {
+		result := runLoadRequest(client, httpServer.URL, path, api, payload, -index-1, stream, affinityMode, timeout)
+		if !result.success {
+			t.Fatalf("warmup request failed: status=%d failure=%s", result.status, result.failure)
+		}
 	}
 	jobs := make(chan int)
 	results := make(chan loadResult, total)
@@ -203,7 +253,7 @@ func TestLiveGenerationLoad(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for index := range jobs {
-				results <- runLoadRequest(client, httpServer.URL, payload, index, stream, timeout)
+				results <- runLoadRequest(client, httpServer.URL, path, api, payload, index, stream, affinityMode, timeout)
 			}
 		}()
 	}
@@ -216,31 +266,95 @@ func TestLiveGenerationLoad(t *testing.T) {
 	elapsed := time.Since(started)
 	peaks := monitor.stop()
 	after := resourceSnapshot()
-	report := summarizeLoad(results, total, concurrency, stream, elapsed, before, after, peaks)
+	report := summarizeLoad(results, total, concurrency, len(payload), stream, api, affinityMode, streamCompression, elapsed, before, after, peaks)
 	t.Log(report)
 }
 
 type loadResult struct {
-	status       int
-	success      bool
-	latency      time.Duration
-	ttfb         time.Duration
-	ttft         time.Duration
-	inputTokens  int64
-	outputTokens int64
-	failure      string
+	status        int
+	success       bool
+	latency       time.Duration
+	headers       time.Duration
+	hasHeaders    bool
+	firstEvent    time.Duration
+	hasFirstEvent bool
+	ttft          time.Duration
+	hasText       bool
+	completed     bool
+	inputTokens   int64
+	outputTokens  int64
+	failure       string
 }
 
-func runLoadRequest(client *http.Client, baseURL string, payload []byte, index int, stream bool, timeout time.Duration) loadResult {
+func TestRunLoadRequestRequiresVisibleTextAndCompletion(t *testing.T) {
+	tests := []struct {
+		name, api, events, wantFailure string
+	}{
+		{
+			name: "complete",
+			events: ": heartbeat\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"\"}\n\n" +
+				"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n" +
+				"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+		},
+		{
+			name: "missing_text", wantFailure: "missing_text",
+			events: "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"\"}\n\n" +
+				"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+		},
+		{
+			name: "incomplete", wantFailure: "incomplete_stream",
+			events: "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n",
+		},
+		{
+			name: "chat", api: "chat",
+			events: "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n" +
+				"data: [DONE]\n\n",
+		},
+		{
+			name: "anthropic", api: "anthropic",
+			events: "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n" +
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, test.events)
+				w.(http.Flusher).Flush()
+			}))
+			defer server.Close()
+			api := test.api
+			if api == "" {
+				api = "responses"
+			}
+			result := runLoadRequest(server.Client(), server.URL, "/v1/responses", api, []byte(`{}`), 0, true, "none", time.Second)
+			if test.wantFailure == "" {
+				if !result.success || !result.hasText || !result.completed {
+					t.Fatalf("result = %#v", result)
+				}
+				return
+			}
+			if result.success || result.failure != test.wantFailure {
+				t.Fatalf("result = %#v, want failure %q", result, test.wantFailure)
+			}
+		})
+	}
+}
+
+func runLoadRequest(client *http.Client, baseURL, path, api string, payload []byte, index int, stream bool, affinityMode string, timeout time.Duration) loadResult {
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/responses", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, bytes.NewReader(payload))
 	if err != nil {
 		return loadResult{latency: time.Since(started), failure: "request_build"}
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Grok-Session-ID", fmt.Sprintf("load-%d", index))
+	if affinityMode == "session" {
+		req.Header.Set("X-Grok-Session-ID", fmt.Sprintf("load-%d", index))
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		failure := "network"
@@ -250,7 +364,7 @@ func runLoadRequest(client *http.Client, baseURL string, payload []byte, index i
 		return loadResult{latency: time.Since(started), failure: failure}
 	}
 	defer resp.Body.Close()
-	result := loadResult{status: resp.StatusCode}
+	result := loadResult{status: resp.StatusCode, headers: time.Since(started), hasHeaders: true}
 	if !stream || resp.StatusCode >= 300 {
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		result.latency = time.Since(started)
@@ -272,8 +386,9 @@ func runLoadRequest(client *http.Client, baseURL string, payload []byte, index i
 	streamFailed := false
 	for scanner.Scan() {
 		line := scanner.Text()
-		if result.ttfb == 0 && strings.TrimSpace(line) != "" {
-			result.ttfb = time.Since(started)
+		if !result.hasFirstEvent && (strings.HasPrefix(line, "event:") || strings.HasPrefix(line, "data:")) {
+			result.firstEvent = time.Since(started)
+			result.hasFirstEvent = true
 		}
 		if strings.HasPrefix(line, "event:") && strings.TrimSpace(strings.TrimPrefix(line, "event:")) == "error" {
 			streamFailed = true
@@ -282,7 +397,13 @@ func runLoadRequest(client *http.Client, baseURL string, payload []byte, index i
 			continue
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "" || data == "[DONE]" {
+		if data == "" {
+			continue
+		}
+		if data == "[DONE]" {
+			if api == "chat" {
+				result.completed = true
+			}
 			continue
 		}
 		var event map[string]any
@@ -290,8 +411,34 @@ func runLoadRequest(client *http.Client, baseURL string, payload []byte, index i
 			continue
 		}
 		typeName, _ := event["type"].(string)
-		if result.ttft == 0 && strings.Contains(typeName, "output_text.delta") {
-			result.ttft = time.Since(started)
+		if !result.hasText {
+			var text string
+			switch api {
+			case "chat":
+				choices, _ := event["choices"].([]any)
+				if len(choices) > 0 {
+					choice, _ := choices[0].(map[string]any)
+					delta, _ := choice["delta"].(map[string]any)
+					text, _ = delta["content"].(string)
+				}
+			case "anthropic":
+				if typeName == "content_block_delta" {
+					delta, _ := event["delta"].(map[string]any)
+					if delta["type"] == "text_delta" {
+						text, _ = delta["text"].(string)
+					}
+				}
+			default:
+				if typeName == "response.output_text.delta" {
+					text, _ = event["delta"].(string)
+				}
+			}
+			if text != "" {
+				result.ttft, result.hasText = time.Since(started), true
+			}
+		}
+		if api == "responses" && typeName == "response.completed" || api == "anthropic" && typeName == "message_stop" {
+			result.completed = true
 		}
 		if typeName == "error" {
 			streamFailed = true
@@ -314,6 +461,14 @@ func runLoadRequest(client *http.Client, baseURL string, payload []byte, index i
 		result.failure = "stream_error"
 		return result
 	}
+	if !result.hasText {
+		result.failure = "missing_text"
+		return result
+	}
+	if !result.completed {
+		result.failure = "incomplete_stream"
+		return result
+	}
 	result.success = true
 	return result
 }
@@ -328,7 +483,9 @@ func responseUsage(body []byte) (int64, int64) {
 
 func usageFromMap(value map[string]any) (int64, int64) {
 	usage, _ := value["usage"].(map[string]any)
-	return jsonInt64(usage["input_tokens"]), jsonInt64(usage["output_tokens"])
+	input := max(jsonInt64(usage["input_tokens"]), jsonInt64(usage["prompt_tokens"]))
+	output := max(jsonInt64(usage["output_tokens"]), jsonInt64(usage["completion_tokens"]))
+	return input, output
 }
 
 func jsonInt64(value any) int64 {
@@ -420,9 +577,10 @@ func resourceSnapshot() processResources {
 	return processResources{cpuSeconds: cpu, heapAlloc: memory.HeapAlloc, totalAlloc: memory.TotalAlloc, numGC: memory.NumGC}
 }
 
-func summarizeLoad(results <-chan loadResult, total, concurrency int, stream bool, elapsed time.Duration, before, after processResources, peaks resourcePeaks) string {
+func summarizeLoad(results <-chan loadResult, total, concurrency, payloadBytes int, stream bool, api, affinityMode, compression string, elapsed time.Duration, before, after processResources, peaks resourcePeaks) string {
 	latencies := make([]time.Duration, 0, total)
-	ttfb := make([]time.Duration, 0, total)
+	headers := make([]time.Duration, 0, total)
+	firstEvent := make([]time.Duration, 0, total)
 	ttft := make([]time.Duration, 0, total)
 	statuses := map[int]int{}
 	failures := map[string]int{}
@@ -430,10 +588,13 @@ func summarizeLoad(results <-chan loadResult, total, concurrency int, stream boo
 	var inputTokens, outputTokens int64
 	for result := range results {
 		latencies = append(latencies, result.latency)
-		if result.ttfb > 0 {
-			ttfb = append(ttfb, result.ttfb)
+		if result.hasHeaders {
+			headers = append(headers, result.headers)
 		}
-		if result.ttft > 0 {
+		if result.hasFirstEvent {
+			firstEvent = append(firstEvent, result.firstEvent)
+		}
+		if result.hasText {
 			ttft = append(ttft, result.ttft)
 		}
 		statuses[result.status]++
@@ -450,10 +611,11 @@ func summarizeLoad(results <-chan loadResult, total, concurrency int, stream boo
 		mode = "stream"
 	}
 	return fmt.Sprintf(
-		"load_summary mode=%s concurrency=%d requests=%d elapsed=%s throughput=%.2f_req_s success=%d success_rate=%.2f%% statuses=%s failures=%s latency[p50=%s p95=%s p99=%s max=%s] ttfb[p50=%s p95=%s p99=%s] ttft[p50=%s p95=%s p99=%s] usage[input=%d output=%d] resources[cpu=%.3fs heap_delta=%dKB heap_peak_delta=%dKB alloc=%dKB gc=%d goroutines_peak=%d]",
-		mode, concurrency, total, elapsed.Round(time.Millisecond), float64(total)/elapsed.Seconds(), successes, float64(successes)*100/float64(total),
+		"load_summary api=%s mode=%s affinity=%s compression=%s concurrency=%d requests=%d payload_bytes=%d elapsed=%s throughput=%.2f_req_s success=%d success_rate=%.2f%% statuses=%s failures=%s latency[p50=%s p95=%s p99=%s max=%s] headers[p50=%s p95=%s p99=%s] first_event[p50=%s p95=%s p99=%s] ttft[samples=%d/%d p50=%s p95=%s p99=%s] usage[input=%d output=%d] resources[cpu=%.3fs heap_delta=%dKB heap_peak_delta=%dKB alloc=%dKB gc=%d goroutines_peak=%d]",
+		api, mode, affinityMode, compression, concurrency, total, payloadBytes, elapsed.Round(time.Millisecond), float64(total)/elapsed.Seconds(), successes, float64(successes)*100/float64(total),
 		formatIntCounts(statuses), formatStringCounts(failures), percentile(latencies, 0.50), percentile(latencies, 0.95), percentile(latencies, 0.99), percentile(latencies, 1),
-		percentile(ttfb, 0.50), percentile(ttfb, 0.95), percentile(ttfb, 0.99), percentile(ttft, 0.50), percentile(ttft, 0.95), percentile(ttft, 0.99),
+		percentile(headers, 0.50), percentile(headers, 0.95), percentile(headers, 0.99), percentile(firstEvent, 0.50), percentile(firstEvent, 0.95), percentile(firstEvent, 0.99),
+		len(ttft), total, percentile(ttft, 0.50), percentile(ttft, 0.95), percentile(ttft, 0.99),
 		inputTokens, outputTokens, after.cpuSeconds-before.cpuSeconds, (int64(after.heapAlloc)-int64(before.heapAlloc))/1024,
 		(int64(peaks.heapAlloc)-int64(before.heapAlloc))/1024, (after.totalAlloc-before.totalAlloc)/1024, after.numGC-before.numGC, peaks.goroutines,
 	)
@@ -503,6 +665,19 @@ func positiveEnvInt(t *testing.T, key string, fallback int) int {
 	value, err := strconv.Atoi(raw)
 	if err != nil || value < 1 {
 		t.Fatalf("%s must be a positive integer", key)
+	}
+	return value
+}
+
+func nonNegativeEnvInt(t *testing.T, key string, fallback int) int {
+	t.Helper()
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		t.Fatalf("%s must be a non-negative integer", key)
 	}
 	return value
 }

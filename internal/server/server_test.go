@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bufio"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Futureppo/grokcli2api-go/internal/auth"
 	"github.com/Futureppo/grokcli2api-go/internal/config"
 )
 
@@ -49,6 +52,9 @@ func TestAPIKeyGateAndChatProxy(t *testing.T) {
 		}
 		if r.Header.Get("x-grok-client-name") == "" {
 			t.Error("missing grok identity header")
+		}
+		if got := r.Header.Get("Accept-Encoding"); got != "gzip" {
+			t.Errorf("non-stream Accept-Encoding = %q, want gzip", got)
 		}
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -111,6 +117,79 @@ func TestQuotaErrorSwitchesAccount(t *testing.T) {
 	defer mu.Unlock()
 	if len(tokens) != 2 || tokens[0] == tokens[1] {
 		t.Fatalf("expected two different accounts, got %v", tokens)
+	}
+}
+
+func TestConcurrent401RefreshesCredentialOnce(t *testing.T) {
+	var refreshCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			refreshCalls.Add(1)
+			time.Sleep(20 * time.Millisecond)
+			writeJSON(w, http.StatusOK, map[string]any{"access_token": "token-new", "refresh_token": "refresh-new", "expires_in": 3600})
+		case "/v1/chat/completions":
+			if r.Header.Get("Authorization") == "Bearer token-old" {
+				writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "expired token"})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"id": "chatcmpl-ok", "choices": []any{}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	dir := t.TempDir()
+	credential := map[string]any{
+		"access_token": "token-old", "refresh_token": "refresh-old", "client_id": "client", "sub": "subject",
+		"expired": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano), "token_endpoint": upstream.URL + "/token",
+		"models": []string{"grok-4"}, "models_updated_at": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	payload, err := json.Marshal(credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "account.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		ChatProxyBaseURL: upstream.URL, ChatProxyVersion: "v1", AuthsDir: dir,
+		AuthsReloadInterval: time.Hour, AuthRefreshConcurrency: 4, AccountMaxInflight: 16,
+		AffinityTTL: time.Hour, AffinityMaxEntries: 1024, RetryMaxAttempts: 2,
+		RetryBaseDelay: time.Millisecond, RateLimitCooldown: time.Minute, QuotaCooldown: 24 * time.Hour,
+		ClientName: "grok-shell", ClientVersion: "0.2.93", ClientSurface: "tui",
+		ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
+	}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	handler := app.Handler()
+	start := make(chan struct{})
+	errorsCh := make(chan error, 12)
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"grok-4","messages":[{"role":"user","content":"hi"}]}`))
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusOK {
+				errorsCh <- fmt.Errorf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		t.Error(err)
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("OAuth refresh calls = %d, want 1", got)
 	}
 }
 
@@ -178,6 +257,9 @@ func TestSessionAffinityDoesNotUseLocalAPIKey(t *testing.T) {
 
 func TestStreamingSSE(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept-Encoding"); got != "identity" {
+			t.Errorf("stream Accept-Encoding = %q, want identity", got)
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n")
 	}))
@@ -189,6 +271,135 @@ func TestStreamingSSE(t *testing.T) {
 	text := rec.Body.String()
 	if rec.Code != 200 || !strings.Contains(text, `"role":"assistant"`) || !strings.Contains(text, `"content":"hi"`) || !strings.HasSuffix(text, "data: [DONE]\n\n") {
 		t.Fatalf("invalid SSE response (%d): %s", rec.Code, text)
+	}
+}
+
+func TestStreamingGzipCompatibilityFallback(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept-Encoding"); got != "gzip" {
+			t.Errorf("stream Accept-Encoding = %q, want gzip", got)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		_, _ = io.WriteString(gz, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n")
+		_ = gz.Close()
+	}))
+	defer upstream.Close()
+	h := newTestHandlerWithTokensAndCompression(t, upstream.URL, nil, []string{"upstream-token"}, "gzip")
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"grok-4","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	h.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"content":"hi"`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestStreamingHeadersAndTextFlushBeforeCompletion(t *testing.T) {
+	tests := []struct {
+		name, route, body, upstreamPath, textEvent, doneEvent, want string
+	}{
+		{
+			name: "chat", route: "/v1/chat/completions", upstreamPath: "/v1/chat/completions", want: "hello",
+			body:      `{"model":"grok-4","messages":[{"role":"user","content":"hi"}],"stream":true}`,
+			textEvent: "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n",
+			doneEvent: "data: [DONE]\n\n",
+		},
+		{
+			name: "responses", route: "/v1/responses", upstreamPath: "/v1/responses", want: "hello",
+			body:      `{"model":"grok-4","input":"hi","stream":true}`,
+			textEvent: "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+			doneEvent: "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+		},
+		{
+			name: "anthropic", route: "/v1/messages", upstreamPath: "/v1/responses", want: "hello",
+			body:      `{"model":"grok-4","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"stream":true}`,
+			textEvent: "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"item-1\",\"delta\":\"hello\"}\n\n",
+			doneEvent: "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			headersSent := make(chan struct{})
+			sendText := make(chan struct{})
+			finish := make(chan struct{})
+			var sendTextOnce, finishOnce sync.Once
+			defer sendTextOnce.Do(func() { close(sendText) })
+			defer finishOnce.Do(func() { close(finish) })
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != test.upstreamPath {
+					t.Errorf("upstream path = %q, want %q", r.URL.Path, test.upstreamPath)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				w.(http.Flusher).Flush()
+				close(headersSent)
+				<-sendText
+				_, _ = io.WriteString(w, test.textEvent)
+				w.(http.Flusher).Flush()
+				<-finish
+				_, _ = io.WriteString(w, test.doneEvent)
+				w.(http.Flusher).Flush()
+			}))
+			defer upstream.Close()
+
+			downstream := httptest.NewServer(newTestHandler(t, upstream.URL, nil))
+			defer downstream.Close()
+			type responseResult struct {
+				response *http.Response
+				err      error
+			}
+			responses := make(chan responseResult, 1)
+			go func() {
+				req, err := http.NewRequest(http.MethodPost, downstream.URL+test.route, strings.NewReader(test.body))
+				if err != nil {
+					responses <- responseResult{err: err}
+					return
+				}
+				req.Header.Set("Content-Type", "application/json")
+				response, err := http.DefaultClient.Do(req)
+				responses <- responseResult{response: response, err: err}
+			}()
+			select {
+			case <-headersSent:
+			case <-time.After(time.Second):
+				t.Fatal("upstream headers were not sent")
+			}
+			var result responseResult
+			select {
+			case result = <-responses:
+				if result.err != nil {
+					t.Fatal(result.err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("downstream headers were not flushed before the first event")
+			}
+			defer result.response.Body.Close()
+			if result.response.StatusCode != http.StatusOK || !strings.Contains(result.response.Header.Get("Cache-Control"), "no-transform") {
+				t.Fatalf("status=%d cache-control=%q", result.response.StatusCode, result.response.Header.Get("Cache-Control"))
+			}
+			sendTextOnce.Do(func() { close(sendText) })
+			textSeen := make(chan error, 1)
+			go func() {
+				scanner := bufio.NewScanner(result.response.Body)
+				for scanner.Scan() {
+					if strings.Contains(scanner.Text(), test.want) {
+						textSeen <- nil
+						return
+					}
+				}
+				textSeen <- scanner.Err()
+			}()
+			select {
+			case err := <-textSeen:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("text was buffered until stream completion")
+			}
+			finishOnce.Do(func() { close(finish) })
+		})
 	}
 }
 
@@ -615,19 +826,19 @@ func TestAffinityInputPrecedenceAndOpaqueConversationID(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	req.Header.Set("X-Grok-Session-ID", "secret-session")
-	if got := requestAffinity(req, body); got != "session:secret-session" {
+	if got := requestAffinity(req, body); got.Key != "session:secret-session" || got.Mode != auth.AffinityHard {
 		t.Fatalf("header affinity = %q", got)
 	}
 	conv := conversationID(requestAffinity(req, body))
-	if conv == "" || strings.Contains(conv, "secret-session") || conv != conversationID("session:secret-session") {
+	if conv == "" || strings.Contains(conv, "secret-session") || conv != conversationID(auth.Affinity{Key: "session:secret-session", Mode: auth.AffinityHard}) {
 		t.Fatalf("conversation id is not stable and opaque: %q", conv)
 	}
 	req.Header.Del("X-Grok-Session-ID")
-	if got := requestAffinity(req, body); got != "cache:cache" {
+	if got := requestAffinity(req, body); got.Key != "cache:cache" || got.Mode != auth.AffinitySoft {
 		t.Fatalf("prompt cache affinity = %q", got)
 	}
 	delete(body, "prompt_cache_key")
-	if got := requestAffinity(req, body); got != "previous:resp" {
+	if got := requestAffinity(req, body); got.Key != "previous:resp" || got.Mode != auth.AffinityHard {
 		t.Fatalf("previous response affinity = %q", got)
 	}
 }
@@ -650,12 +861,16 @@ func newTestHandler(t *testing.T, upstream string, keys []string) http.Handler {
 }
 
 func newTestHandlerWithTokens(t *testing.T, upstream string, keys, tokens []string) http.Handler {
+	return newTestHandlerWithTokensAndCompression(t, upstream, keys, tokens, "")
+}
+
+func newTestHandlerWithTokensAndCompression(t *testing.T, upstream string, keys, tokens []string, compression string) http.Handler {
 	t.Helper()
 	dir := t.TempDir()
 	for i, token := range tokens {
 		writeCredentialFile(t, dir, fmt.Sprintf("test-%d", i), token)
 	}
-	cfg := config.Config{ChatProxyBaseURL: upstream, ChatProxyVersion: "v1", AuthsDir: dir, AuthsReloadInterval: time.Hour, AuthRefreshConcurrency: 1, AffinityTTL: time.Hour, AffinityMaxEntries: 1024, RetryMaxAttempts: 3, RetryBaseDelay: time.Millisecond, RateLimitCooldown: time.Minute, QuotaCooldown: 24 * time.Hour, ClientName: "grok-shell", ClientVersion: "0.2.93", ClientSurface: "tui", ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli", APIKeys: keys}
+	cfg := config.Config{ChatProxyBaseURL: upstream, ChatProxyVersion: "v1", AuthsDir: dir, AuthsReloadInterval: time.Hour, AuthRefreshConcurrency: 1, AffinityTTL: time.Hour, AffinityMaxEntries: 1024, RetryMaxAttempts: 3, RetryBaseDelay: time.Millisecond, RateLimitCooldown: time.Minute, QuotaCooldown: 24 * time.Hour, ClientName: "grok-shell", ClientVersion: "0.2.93", ClientSurface: "tui", ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli", StreamCompression: compression, APIKeys: keys}
 	s, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)

@@ -105,6 +105,63 @@ func TestConcurrentRefreshIsSingleFlight(t *testing.T) {
 	}
 }
 
+func TestConcurrentForcedRefreshUsesCredentialGeneration(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		time.Sleep(20 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"token-new","refresh_token":"refresh-new","expires_in":3600}`))
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	path := writeTestCredential(t, dir, "a.json", "subject-a", "token-old", time.Now().Add(time.Hour), server.URL)
+	cred, err := loadCredential(path, "tui")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &account{id: accountID(cred.Subject), credential: cred, agentID: "agent", sessionID: "session"}
+	a.generation.Store(1)
+	p := &Pool{
+		cfg: PoolConfig{RefreshConcurrency: 4}, http: server.Client(), accounts: map[string]*account{a.id: a},
+		files: map[string]fileEntry{path: {cred: cred}}, states: map[string]accountState{},
+		affinity: newAffinityCache(time.Hour, 100), refreshSem: make(chan struct{}, 4), closed: make(chan struct{}),
+	}
+	p.active.Store([]*account{a})
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := p.RefreshIfUnchanged(context.Background(), a.id, 1); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if calls.Load() != 1 || a.currentGeneration() != 2 {
+		t.Fatalf("refresh calls=%d generation=%d, want 1 and 2", calls.Load(), a.currentGeneration())
+	}
+}
+
+func TestRefreshLockWaitHonorsContext(t *testing.T) {
+	a := &account{}
+	if err := a.acquireRefresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer a.releaseRefresh()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := a.acquireRefresh(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("acquireRefresh() error = %v, want deadline exceeded", err)
+	}
+	if time.Since(started) > 250*time.Millisecond {
+		t.Fatalf("canceled refresh wait took too long: %s", time.Since(started))
+	}
+}
+
 func TestRefreshPreservesQuotaCooldown(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -135,7 +192,7 @@ func TestPoolRoundRobinAffinityAndConcurrentLease(t *testing.T) {
 	defer pool.Close()
 	seen := map[string]bool{}
 	for i := 0; i < 3; i++ {
-		lease, err := pool.Acquire(context.Background(), "", "grok-4", nil)
+		lease, err := pool.Acquire(context.Background(), Affinity{}, "grok-4", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -145,14 +202,14 @@ func TestPoolRoundRobinAffinityAndConcurrentLease(t *testing.T) {
 	if len(seen) != 3 {
 		t.Fatalf("round robin selected %d accounts", len(seen))
 	}
-	first, err := pool.Acquire(context.Background(), "session:one", "grok-4", nil)
+	first, err := pool.Acquire(context.Background(), Affinity{Key: "session:one", Mode: AffinityHard}, "grok-4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := first.AccountID()
 	first.Release()
 	pool.BindResponseID("resp-one", "grok-4", id)
-	byResponse, err := pool.Acquire(context.Background(), "previous:resp-one", "grok-4", nil)
+	byResponse, err := pool.Acquire(context.Background(), Affinity{Key: "previous:resp-one", Mode: AffinityHard}, "grok-4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +222,7 @@ func TestPoolRoundRobinAffinityAndConcurrentLease(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lease, err := pool.Acquire(context.Background(), "session:one", "grok-4", nil)
+			lease, err := pool.Acquire(context.Background(), Affinity{Key: "session:one", Mode: AffinityHard}, "grok-4", nil)
 			if err != nil {
 				t.Error(err)
 				return
@@ -186,11 +243,11 @@ func TestPoolWaitsForPerAccountCapacity(t *testing.T) {
 	defer pool.Close()
 	pool.cfg.AccountMaxInflight = 2
 
-	first, err := pool.Acquire(context.Background(), "", "grok-4", nil)
+	first, err := pool.Acquire(context.Background(), Affinity{}, "grok-4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := pool.Acquire(context.Background(), "", "grok-4", nil)
+	second, err := pool.Acquire(context.Background(), Affinity{}, "grok-4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +256,7 @@ func TestPoolWaitsForPerAccountCapacity(t *testing.T) {
 	result := make(chan *Lease, 1)
 	errorsCh := make(chan error, 1)
 	go func() {
-		lease, acquireErr := pool.Acquire(ctx, "", "grok-4", nil)
+		lease, acquireErr := pool.Acquire(ctx, Affinity{}, "grok-4", nil)
 		if acquireErr != nil {
 			errorsCh <- acquireErr
 			return
@@ -224,6 +281,87 @@ func TestPoolWaitsForPerAccountCapacity(t *testing.T) {
 		t.Fatal("waiting request was not notified when account capacity became available")
 	}
 	second.Release()
+}
+
+func TestSoftAffinitySpillsWhileHardAffinityWaits(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
+	writeTestCredential(t, dir, "b.json", "subject-b", "token-b", time.Now().Add(time.Hour), "")
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	pool.cfg.AccountMaxInflight = 1
+
+	soft := Affinity{Key: "cache:shared", Mode: AffinitySoft}
+	first, err := pool.Acquire(context.Background(), soft, "grok-4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := pool.Acquire(context.Background(), soft, "grok-4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.AccountID() == second.AccountID() {
+		t.Fatal("soft affinity did not spill to an idle account")
+	}
+	first.Release()
+	second.Release()
+
+	hard := Affinity{Key: "session:strict", Mode: AffinityHard}
+	pinned, err := pool.Acquire(context.Background(), hard, "grok-4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		lease *Lease
+		err   error
+	}
+	results := make(chan result, 1)
+	go func() {
+		lease, acquireErr := pool.Acquire(context.Background(), hard, "grok-4", nil)
+		results <- result{lease: lease, err: acquireErr}
+	}()
+	select {
+	case got := <-results:
+		if got.lease != nil {
+			got.lease.Release()
+		}
+		pinned.Release()
+		t.Fatal("hard affinity bypassed its busy account")
+	case <-time.After(30 * time.Millisecond):
+	}
+	pinnedID := pinned.AccountID()
+	pinned.Release()
+	select {
+	case got := <-results:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		defer got.lease.Release()
+		if got.lease.AccountID() != pinnedID {
+			t.Fatalf("hard affinity moved from %s to %s", pinnedID, got.lease.AccountID())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("hard affinity waiter was not released")
+	}
+}
+
+func TestPoolPrefersLeastInflightAccount(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
+	writeTestCredential(t, dir, "b.json", "subject-b", "token-b", time.Now().Add(time.Hour), "")
+	pool := newTestPool(t, dir)
+	defer pool.Close()
+	active := pool.schedulingSnapshot("grok-4")
+	active[0].inflight.Store(3)
+	defer active[0].inflight.Store(0)
+	lease, err := pool.Acquire(context.Background(), Affinity{}, "grok-4", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.AccountID() == active[0].id {
+		t.Fatal("scheduler selected the more loaded account")
+	}
 }
 
 func TestCooldownUpdatesAreCoalescedAndExpireWithoutDirectoryScan(t *testing.T) {
@@ -284,7 +422,7 @@ func TestPoolAggregatesPersistsAndSchedulesModels(t *testing.T) {
 	if got, want := strings.Join(pool.Models(), ","), "grok-alpha,grok-beta,grok-shared"; got != want {
 		t.Fatalf("aggregated models = %q, want %q", got, want)
 	}
-	lease, err := pool.Acquire(context.Background(), "session:beta", "grok-beta", nil)
+	lease, err := pool.Acquire(context.Background(), Affinity{Key: "session:beta", Mode: AffinityHard}, "grok-beta", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +431,7 @@ func TestPoolAggregatesPersistsAndSchedulesModels(t *testing.T) {
 	}
 	lease.Release()
 
-	_, err = pool.Acquire(context.Background(), "", "grok-unknown", nil)
+	_, err = pool.Acquire(context.Background(), Affinity{}, "grok-unknown", nil)
 	var unavailable *ModelUnavailableError
 	if !errors.As(err, &unavailable) || unavailable.Model != "grok-unknown" {
 		t.Fatalf("unknown model error = %v, want ModelUnavailableError", err)
@@ -343,14 +481,14 @@ func TestCooldownPersistsAndAffinityMigrates(t *testing.T) {
 	writeTestCredential(t, dir, "a.json", "subject-a", "token-a", time.Now().Add(time.Hour), "")
 	writeTestCredential(t, dir, "b.json", "subject-b", "token-b", time.Now().Add(time.Hour), "")
 	pool := newTestPool(t, dir)
-	lease, err := pool.Acquire(context.Background(), "session:one", "grok-4", nil)
+	lease, err := pool.Acquire(context.Background(), Affinity{Key: "session:one", Mode: AffinityHard}, "grok-4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cooledID := lease.AccountID()
 	lease.Release()
 	pool.MarkCooldown(cooledID, "quota_exhausted", time.Hour)
-	migrated, err := pool.Acquire(context.Background(), "session:one", "grok-4", nil)
+	migrated, err := pool.Acquire(context.Background(), Affinity{Key: "session:one", Mode: AffinityHard}, "grok-4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +556,7 @@ func BenchmarkPoolAcquireTenThousandAccounts(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			lease, err := p.Acquire(context.Background(), "", "grok-4", nil)
+			lease, err := p.Acquire(context.Background(), Affinity{}, "grok-4", nil)
 			if err != nil {
 				b.Fatal(err)
 			}

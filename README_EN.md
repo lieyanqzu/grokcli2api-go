@@ -187,6 +187,7 @@ When local API-key protection is enabled, protected endpoints accept any of thes
 | --- | --- | --- |
 | `GROK_CHAT_PROXY_BASE_URL` | `https://cli-chat-proxy.grok.com` | Grok CLI upstream URL |
 | `GROK_CHAT_PROXY_VERSION` | `v1` | Upstream API version |
+| `GROK_STREAM_COMPRESSION` | `identity` | Streaming compression; `identity` avoids gzip buffering of SSE and `gzip` is a compatibility fallback |
 | `GROK_PROXY_URL` | empty | HTTP(S), SOCKS5, or SOCKS5H outbound proxy |
 | `GROK_NO_PROXY` | empty | Comma-separated proxy bypass rules |
 | `GROK_TLS_INSECURE_SKIP_VERIFY` | `false` | Disable upstream TLS verification; controlled debugging only |
@@ -231,6 +232,16 @@ curl http://localhost:8088/v1/models \
 - Report vulnerabilities privately through [GitHub Security Advisories](https://github.com/Futureppo/grokcli2api-go/security/advisories/new).
 
 ## Development and contributing
+
+The opt-in live load test reports response headers, first event, first non-empty text, completion latency, and sample coverage. It consumes real upstream usage and is skipped by default:
+
+```bash
+GROK_LIVE_LOAD=1 GROK_LOAD_MODEL=grok-4 GROK_LOAD_STREAM=1 \
+GROK_LOAD_WARMUP=4 GROK_LOAD_CONCURRENCY=4 GROK_LOAD_REQUESTS=16 \
+GROK_LOAD_API=responses GROK_LOAD_AFFINITY=cache go test ./internal/server -run TestLiveGenerationLoad -v
+```
+
+`GROK_LOAD_API` accepts `responses`, `chat`, or `anthropic`; `GROK_LOAD_AFFINITY` accepts `none`, `session`, or `cache`; and `GROK_LOAD_INPUT_BYTES` generates a requested input size. Set `GROK2API_LOG_LEVEL=DEBUG` for segmented timing logs that omit credentials, bodies, and session identifiers.
 
 ```bash
 go test ./...

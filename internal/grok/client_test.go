@@ -37,6 +37,20 @@ func TestBypassProxy(t *testing.T) {
 	}
 }
 
+func TestHTTPClientKeepsWarmConnections(t *testing.T) {
+	client, err := NewHTTPClient(config.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T", client.Transport)
+	}
+	if transport.IdleConnTimeout != 5*time.Minute || transport.MaxIdleConnsPerHost != 32 {
+		t.Fatalf("idle timeout=%s per-host=%d", transport.IdleConnTimeout, transport.MaxIdleConnsPerHost)
+	}
+}
+
 func TestRefreshModelsDiscoversEveryAccountAndPersistsCatalogs(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

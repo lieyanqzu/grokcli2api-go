@@ -83,14 +83,29 @@ type EventStream struct {
 	accountID     string
 	model         string
 	quotaCooldown time.Duration
+	timing        *RequestTiming
 	closeOnce     sync.Once
+}
+
+type timedReadCloser struct {
+	io.ReadCloser
+	timing *RequestTiming
+	once   sync.Once
+}
+
+func (r *timedReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if n > 0 {
+		r.once.Do(r.timing.MarkFirstBodyByte)
+	}
+	return n, err
 }
 
 func NewHTTPClient(cfg config.Config) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 32
-	transport.IdleConnTimeout = 90 * time.Second
+	transport.IdleConnTimeout = 5 * time.Minute
 	transport.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	transport.TLSHandshakeTimeout = 10 * time.Second
 	transport.ResponseHeaderTimeout = 90 * time.Second
@@ -123,6 +138,12 @@ func NewHTTPClient(cfg config.Config) (*http.Client, error) {
 }
 
 func NewClient(cfg config.Config, pool *auth.Pool, httpClient *http.Client) (*Client, error) {
+	if cfg.StreamCompression == "" {
+		cfg.StreamCompression = "identity"
+	}
+	if cfg.StreamCompression != "identity" && cfg.StreamCompression != "gzip" {
+		return nil, fmt.Errorf("invalid stream compression %q", cfg.StreamCompression)
+	}
 	if cfg.RetryMaxAttempts < 1 {
 		cfg.RetryMaxAttempts = 3
 	}
@@ -351,7 +372,8 @@ func (c *Client) URL(path string) string {
 	return c.cfg.ChatProxyBaseURL + "/" + c.cfg.ChatProxyVersion + "/" + strings.TrimLeft(path, "/")
 }
 
-func (c *Client) DoJSON(ctx context.Context, method, path string, body map[string]any, affinity, convID, model string, trace bool) (map[string]any, error) {
+func (c *Client) DoJSON(ctx context.Context, method, path string, body map[string]any, affinity auth.Affinity, convID, model string, trace bool) (map[string]any, error) {
+	timing := RequestTimingFromContext(ctx)
 	payload, err := marshalBody(body)
 	if err != nil {
 		return nil, err
@@ -363,12 +385,14 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 	for len(used) < c.cfg.RetryMaxAttempts {
 		var lease *auth.Lease
 		var err error
+		acquireStarted := time.Now()
 		if preferredID != "" {
 			lease, err = c.pool.AcquireAccount(ctx, preferredID)
 			preferredID = ""
 		} else {
 			lease, err = c.pool.Acquire(ctx, affinity, model, used)
 		}
+		timing.MarkAcquire(time.Since(acquireStarted))
 		if err != nil {
 			var unavailable *auth.UnavailableError
 			if errors.As(err, &unavailable) {
@@ -380,6 +404,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 			return nil, err
 		}
 		accountID := lease.AccountID()
+		generation := lease.Generation()
 		used[accountID] = struct{}{}
 		resp, wrote, err := c.do(ctx, lease, method, path, payload, convID, model, trace, false)
 		if err != nil {
@@ -405,7 +430,10 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 			lastErr = apiErr
 			if isAuthError(apiErr) && !refreshed[accountID] {
 				refreshed[accountID] = true
-				if refreshErr := c.pool.Refresh(ctx, accountID); refreshErr == nil {
+				refreshStarted := time.Now()
+				refreshErr := c.pool.RefreshIfUnchanged(ctx, accountID, generation)
+				timing.MarkRefresh(time.Since(refreshStarted))
+				if refreshErr == nil {
 					delete(used, accountID)
 					preferredID = accountID
 					continue
@@ -444,7 +472,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 	return nil, auth.ErrNoAuth
 }
 
-func (c *Client) decodeSuccess(payload []byte, affinity, model, accountID string) (map[string]any, error) {
+func (c *Client) decodeSuccess(payload []byte, affinity auth.Affinity, model, accountID string) (map[string]any, error) {
 	c.pool.Bind(affinity, model, accountID)
 	if len(payload) == 0 {
 		return map[string]any{}, nil
@@ -459,7 +487,8 @@ func (c *Client) decodeSuccess(payload []byte, affinity, model, accountID string
 	return out, nil
 }
 
-func (c *Client) OpenStream(ctx context.Context, path string, body map[string]any, affinity, convID, model string, trace bool) (*EventStream, error) {
+func (c *Client) OpenStream(ctx context.Context, path string, body map[string]any, affinity auth.Affinity, convID, model string, trace bool) (*EventStream, error) {
+	timing := RequestTimingFromContext(ctx)
 	payload, err := marshalBody(body)
 	if err != nil {
 		return nil, err
@@ -471,12 +500,14 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 	for len(used) < c.cfg.RetryMaxAttempts {
 		var lease *auth.Lease
 		var err error
+		acquireStarted := time.Now()
 		if preferredID != "" {
 			lease, err = c.pool.AcquireAccount(ctx, preferredID)
 			preferredID = ""
 		} else {
 			lease, err = c.pool.Acquire(ctx, affinity, model, used)
 		}
+		timing.MarkAcquire(time.Since(acquireStarted))
 		if err != nil {
 			var unavailable *auth.UnavailableError
 			if errors.As(err, &unavailable) {
@@ -488,6 +519,7 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 			return nil, err
 		}
 		accountID := lease.AccountID()
+		generation := lease.Generation()
 		used[accountID] = struct{}{}
 		resp, wrote, err := c.do(ctx, lease, http.MethodPost, path, payload, convID, model, trace, true)
 		if err != nil {
@@ -512,7 +544,10 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 			lastErr = apiErr
 			if isAuthError(apiErr) && !refreshed[accountID] {
 				refreshed[accountID] = true
-				if c.pool.Refresh(ctx, accountID) == nil {
+				refreshStarted := time.Now()
+				refreshErr := c.pool.RefreshIfUnchanged(ctx, accountID, generation)
+				timing.MarkRefresh(time.Since(refreshStarted))
+				if refreshErr == nil {
 					delete(used, accountID)
 					preferredID = accountID
 					continue
@@ -545,8 +580,8 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 		}
 		c.pool.Bind(affinity, model, accountID)
 		scanner := bufio.NewScanner(responseReader(resp))
-		scanner.Buffer(make([]byte, 64*1024), 4<<20)
-		return &EventStream{response: resp, scanner: scanner, pool: c.pool, lease: lease, accountID: accountID, model: model, quotaCooldown: c.cfg.QuotaCooldown}, nil
+		scanner.Buffer(make([]byte, 8*1024), 4<<20)
+		return &EventStream{response: resp, scanner: scanner, pool: c.pool, lease: lease, accountID: accountID, model: model, quotaCooldown: c.cfg.QuotaCooldown, timing: timing}, nil
 	}
 	if lastErr != nil {
 		return nil, lastErr
@@ -556,7 +591,9 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 
 func (c *Client) do(ctx context.Context, lease *auth.Lease, method, path string, payload []byte, convID, model string, trace, stream bool) (*http.Response, bool, error) {
 	var wrote atomic.Bool
-	requestCtx := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) { wrote.Store(true) }})
+	timing := RequestTimingFromContext(ctx)
+	timing.MarkAttempt()
+	requestCtx := httptrace.WithClientTrace(ctx, timing.ClientTrace(func() { wrote.Store(true) }))
 	var reader io.Reader
 	if payload != nil {
 		reader = bytes.NewReader(payload)
@@ -571,6 +608,7 @@ func (c *Client) do(ctx context.Context, lease *auth.Lease, method, path string,
 	}
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Accept-Encoding", c.cfg.StreamCompression)
 		if trace {
 			req.Header.Set("User-Agent", chatUserAgent(c.cfg))
 		}
@@ -579,6 +617,8 @@ func (c *Client) do(ctx context.Context, lease *auth.Lease, method, path string,
 	if err != nil {
 		return nil, wrote.Load(), fmt.Errorf("upstream request: %w", err)
 	}
+	timing.MarkUpstreamHeaders(resp.Header.Get("Content-Encoding"))
+	resp.Body = &timedReadCloser{ReadCloser: resp.Body, timing: timing}
 	return resp, wrote.Load(), nil
 }
 
@@ -661,6 +701,7 @@ func (s *EventStream) Next() (SSEEvent, bool, error) {
 		line := strings.TrimSuffix(s.scanner.Text(), "\r")
 		if line == "" {
 			if hasField {
+				s.timing.MarkFirstEvent()
 				s.observe(event.Data)
 				return event, true, nil
 			}
@@ -696,6 +737,7 @@ func (s *EventStream) Next() (SSEEvent, bool, error) {
 		return SSEEvent{}, false, err
 	}
 	if hasField {
+		s.timing.MarkFirstEvent()
 		s.observe(event.Data)
 		return event, true, nil
 	}
@@ -710,6 +752,9 @@ func (s *EventStream) observe(data []byte) {
 	if json.Unmarshal(data, &payload) != nil {
 		return
 	}
+	if payloadHasVisibleText(payload) {
+		s.timing.MarkFirstUpstreamText()
+	}
 	if id := responseID(payload); id != "" {
 		s.pool.BindResponseID(id, s.model, s.accountID)
 	}
@@ -720,6 +765,23 @@ func (s *EventStream) observe(data []byte) {
 	if strings.EqualFold(code, quotaErrorCode) {
 		s.pool.MarkCooldown(s.accountID, "quota_exhausted", s.quotaCooldown)
 	}
+}
+
+func payloadHasVisibleText(payload map[string]any) bool {
+	kind, _ := payload["type"].(string)
+	if kind == "response.output_text.delta" {
+		text, _ := payload["delta"].(string)
+		return text != ""
+	}
+	choices, _ := payload["choices"].([]any)
+	for _, raw := range choices {
+		choice, _ := raw.(map[string]any)
+		delta, _ := choice["delta"].(map[string]any)
+		if text, _ := delta["content"].(string); text != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func responseID(payload map[string]any) string {

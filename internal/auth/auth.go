@@ -152,6 +152,16 @@ func (c *credential) needsRefresh(now time.Time, jitter time.Duration) bool {
 	return !now.Add(2*time.Minute + jitter).Before(c.ExpiresAt)
 }
 
+func (c *credential) usable(now time.Time) bool {
+	if c.AccessToken == "" {
+		return false
+	}
+	if c.ExpiresAt.IsZero() {
+		return true
+	}
+	return now.Add(time.Minute).Before(c.ExpiresAt)
+}
+
 func (c *credential) refresh(ctx context.Context, client *http.Client) (*credential, error) {
 	if c.RefreshToken == "" || c.ClientID == "" {
 		return nil, &RefreshError{Permanent: true, Code: "missing_refresh_metadata"}

@@ -187,6 +187,7 @@ curl http://localhost:8088/v1/messages \
 | --- | --- | --- |
 | `GROK_CHAT_PROXY_BASE_URL` | `https://cli-chat-proxy.grok.com` | Grok CLI 上游地址 |
 | `GROK_CHAT_PROXY_VERSION` | `v1` | 上游 API 版本 |
+| `GROK_STREAM_COMPRESSION` | `identity` | 流式响应压缩；`identity` 避免 gzip 缓冲 SSE，`gzip` 用于兼容回退 |
 | `GROK_PROXY_URL` | 空 | 出站代理，支持 HTTP(S)、SOCKS5、SOCKS5H |
 | `GROK_NO_PROXY` | 空 | 逗号分隔的代理绕过规则 |
 | `GROK_TLS_INSECURE_SKIP_VERIFY` | `false` | 跳过上游 TLS 验证，仅用于受控调试环境 |
@@ -231,6 +232,16 @@ curl http://localhost:8088/v1/models \
 - 安全漏洞请通过 [GitHub Security Advisories](https://github.com/Futureppo/grokcli2api-go/security/advisories/new) 私下报告。
 
 ## 开发与贡献
+
+流式性能可使用真实负载测试测量。它会报告响应头、首事件、非空首文本、完成时间及样本覆盖率；测试会产生真实上游用量，因此默认跳过：
+
+```bash
+GROK_LIVE_LOAD=1 GROK_LOAD_MODEL=grok-4 GROK_LOAD_STREAM=1 \
+GROK_LOAD_WARMUP=4 GROK_LOAD_CONCURRENCY=4 GROK_LOAD_REQUESTS=16 \
+GROK_LOAD_API=responses GROK_LOAD_AFFINITY=cache go test ./internal/server -run TestLiveGenerationLoad -v
+```
+
+`GROK_LOAD_API` 支持 `responses`、`chat` 和 `anthropic`；`GROK_LOAD_AFFINITY` 支持 `none`、`session` 和 `cache`；`GROK_LOAD_INPUT_BYTES` 可生成指定大小的输入。设置 `GROK2API_LOG_LEVEL=DEBUG` 可查看不包含凭证、正文和会话标识的分段耗时日志。
 
 ```bash
 go test ./...

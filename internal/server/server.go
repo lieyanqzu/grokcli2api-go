@@ -131,15 +131,23 @@ func (s *Server) apiKeyStatus(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
+	timing := grok.NewRequestTiming("chat.completions")
+	r = r.WithContext(grok.WithRequestTiming(r.Context(), timing))
+	defer finishTiming(r.Context(), timing)
+	decodeStarted := time.Now()
 	body, ok := decodeRequest(w, r)
+	timing.MarkDecode(time.Since(decodeStarted))
 	if !ok {
 		return
 	}
+	prepareStarted := time.Now()
 	if err := openai.ValidateChatRequest(body); err != nil {
+		timing.MarkPrepare(time.Since(prepareStarted))
 		writeError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "422")
 		return
 	}
 	wire := openai.PrepareChat(body)
+	timing.MarkPrepare(time.Since(prepareStarted))
 	model := openai.String(body, "model", "")
 	affinity := requestAffinity(r, body)
 	convID := conversationID(affinity)
@@ -156,12 +164,19 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
+	timing := grok.NewRequestTiming("responses")
+	r = r.WithContext(grok.WithRequestTiming(r.Context(), timing))
+	defer finishTiming(r.Context(), timing)
+	decodeStarted := time.Now()
 	body, ok := decodeRequest(w, r)
+	timing.MarkDecode(time.Since(decodeStarted))
 	if !ok {
 		return
 	}
+	prepareStarted := time.Now()
 	native := isGrokBuildClient(r)
 	if err := openai.ValidateResponsesRequest(body, native); err != nil {
+		timing.MarkPrepare(time.Since(prepareStarted))
 		writeError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "422")
 		return
 	}
@@ -173,10 +188,12 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		var err error
 		wire, compat, err = openai.PrepareCompatibleResponses(body)
 		if err != nil {
+			timing.MarkPrepare(time.Since(prepareStarted))
 			writeError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "422")
 			return
 		}
 	}
+	timing.MarkPrepare(time.Since(prepareStarted))
 	model := openai.String(body, "model", "")
 	affinity := requestAffinity(r, body)
 	convID := conversationID(affinity)
@@ -197,20 +214,28 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
+	timing := grok.NewRequestTiming("anthropic.messages")
+	r = r.WithContext(grok.WithRequestTiming(r.Context(), timing))
+	defer finishTiming(r.Context(), timing)
 	version := strings.TrimSpace(r.Header.Get("anthropic-version"))
 	if version == "" {
 		version = anthropic.DefaultVersion
 	}
 	slog.Debug("anthropic request", "version", version)
+	decodeStarted := time.Now()
 	body, ok := decodeAnthropicRequest(w, r)
+	timing.MarkDecode(time.Since(decodeStarted))
 	if !ok {
 		return
 	}
+	prepareStarted := time.Now()
 	prepared, err := anthropic.Prepare(body)
 	if err != nil {
+		timing.MarkPrepare(time.Since(prepareStarted))
 		writeAnthropicError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
+	timing.MarkPrepare(time.Since(prepareStarted))
 	for _, field := range prepared.Warnings {
 		slog.Warn("anthropic compatibility field stripped", "field", field, "path", r.URL.Path)
 	}
@@ -229,7 +254,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 	s.streamAnthropic(w, r, prepared.Body, affinity, convID, model)
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity, convID, model string) {
+func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity auth.Affinity, convID, model string) {
 	stream, err := s.client.OpenStream(r.Context(), "chat/completions", wire, affinity, convID, fmt.Sprint(wire["model"]), false)
 	if err != nil {
 		s.writeClientError(w, err)
@@ -237,15 +262,10 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, wire map[str
 	}
 	defer stream.Close()
 
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	flush := func() {
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-	}
+	prepareSSE(w)
+	flush := flusher(w)
+	timing := grok.RequestTimingFromContext(r.Context())
+	timing.MarkDownstreamFlush(false)
 	roleSent := false
 	for {
 		event, ok, nextErr := stream.Next()
@@ -269,12 +289,13 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, wire map[str
 			_ = writeSSEData(w, event.Data)
 		}
 		flush()
+		timing.MarkDownstreamFlush(chatChunkHasText(chunk))
 	}
 	_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	flush()
 }
 
-func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity, convID, model string, native bool, compat *openai.ResponsesCompatibility) {
+func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity auth.Affinity, convID, model string, native bool, compat *openai.ResponsesCompatibility) {
 	stream, err := s.client.OpenStream(r.Context(), "responses", wire, affinity, convID, fmt.Sprint(wire["model"]), true)
 	if err != nil {
 		s.writeClientError(w, err)
@@ -283,6 +304,8 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire ma
 	defer stream.Close()
 	prepareSSE(w)
 	flush := flusher(w)
+	timing := grok.RequestTimingFromContext(r.Context())
+	timing.MarkDownstreamFlush(false)
 	for {
 		event, ok, nextErr := stream.Next()
 		if nextErr != nil {
@@ -307,6 +330,7 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire ma
 				flush()
 				return
 			}
+			visibleText := false
 			for index, output := range translated {
 				translatedEvent := grok.SSEEvent{Event: output.Event, Data: output.Data}
 				if index == 0 {
@@ -322,18 +346,21 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, wire ma
 				if err := writeRawSSE(w, translatedEvent); err != nil {
 					return
 				}
+				visibleText = visibleText || responseEventHasText(translatedEvent.Data)
 			}
 			flush()
+			timing.MarkDownstreamFlush(visibleText)
 			continue
 		}
 		if err := writeRawSSE(w, event); err != nil {
 			return
 		}
 		flush()
+		timing.MarkDownstreamFlush(responseEventHasText(event.Data))
 	}
 }
 
-func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity, convID, model string) {
+func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, wire map[string]any, affinity auth.Affinity, convID, model string) {
 	stream, err := s.client.OpenStream(r.Context(), "responses", wire, affinity, convID, fmt.Sprint(wire["model"]), true)
 	if err != nil {
 		s.writeAnthropicClientError(w, err)
@@ -342,6 +369,8 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, wire ma
 	defer stream.Close()
 	prepareSSE(w)
 	flush := flusher(w)
+	timing := grok.RequestTimingFromContext(r.Context())
+	timing.MarkDownstreamFlush(false)
 	translator := anthropic.NewStreamTranslator(model)
 	for {
 		event, ok, nextErr := stream.Next()
@@ -370,6 +399,7 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, wire ma
 				return
 			}
 			flush()
+			timing.MarkDownstreamFlush(anthropicEventHasText(outgoing))
 		}
 	}
 }
@@ -640,9 +670,12 @@ func writeAnthropicSSE(w io.Writer, event anthropic.Event) error {
 }
 func prepareSSE(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 func flusher(w http.ResponseWriter) func() {
 	return func() {
@@ -651,6 +684,43 @@ func flusher(w http.ResponseWriter) func() {
 		}
 	}
 }
+
+func finishTiming(ctx context.Context, timing *grok.RequestTiming) {
+	outcome := "complete"
+	if ctx.Err() != nil {
+		outcome = "canceled"
+	}
+	timing.Finish(outcome)
+}
+
+func chatChunkHasText(chunk map[string]any) bool {
+	choices, _ := chunk["choices"].([]any)
+	for _, raw := range choices {
+		choice, _ := raw.(map[string]any)
+		delta, _ := choice["delta"].(map[string]any)
+		if text, _ := delta["content"].(string); text != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func responseEventHasText(data []byte) bool {
+	var payload map[string]any
+	if json.Unmarshal(data, &payload) != nil || openai.String(payload, "type", "") != "response.output_text.delta" {
+		return false
+	}
+	return openai.String(payload, "delta", "") != ""
+}
+
+func anthropicEventHasText(event anthropic.Event) bool {
+	if event.Name != "content_block_delta" {
+		return false
+	}
+	delta, _ := event.Data["delta"].(map[string]any)
+	return openai.String(delta, "type", "") == "text_delta" && openai.String(delta, "text", "") != ""
+}
+
 func anthropicErrorType(status int) string {
 	switch status {
 	case http.StatusBadRequest, http.StatusUnprocessableEntity:
@@ -684,32 +754,32 @@ func isGrokBuildClient(r *http.Request) bool {
 	return false
 }
 
-func requestAffinity(r *http.Request, body map[string]any) string {
+func requestAffinity(r *http.Request, body map[string]any) auth.Affinity {
 	if value := strings.TrimSpace(r.Header.Get("X-Grok-Session-ID")); value != "" {
-		return "session:" + value
+		return auth.Affinity{Key: "session:" + value, Mode: auth.AffinityHard}
 	}
 	if value := openai.String(body, "prompt_cache_key", ""); value != "" {
-		return "cache:" + value
+		return auth.Affinity{Key: "cache:" + value, Mode: auth.AffinitySoft}
 	}
 	if value := openai.String(body, "previous_response_id", ""); value != "" {
-		return "previous:" + value
+		return auth.Affinity{Key: "previous:" + value, Mode: auth.AffinityHard}
 	}
 	if value := openai.String(body, "user", ""); value != "" {
-		return "user:" + value
+		return auth.Affinity{Key: "user:" + value, Mode: auth.AffinitySoft}
 	}
 	if metadata, ok := body["metadata"].(map[string]any); ok {
 		if value := openai.String(metadata, "user_id", ""); value != "" {
-			return "user:" + value
+			return auth.Affinity{Key: "user:" + value, Mode: auth.AffinitySoft}
 		}
 	}
-	return ""
+	return auth.Affinity{}
 }
 
-func conversationID(affinity string) string {
-	if affinity == "" {
+func conversationID(affinity auth.Affinity) string {
+	if affinity.Key == "" {
 		return grok.NewID()
 	}
-	sum := sha256.Sum256([]byte(affinity))
+	sum := sha256.Sum256([]byte(affinity.Key))
 	return hex.EncodeToString(sum[:16])
 }
 func constantEqual(a, b string) int {

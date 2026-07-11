@@ -22,6 +22,19 @@ const stateFileName = ".grokcli2api-state.json"
 
 var errAccountBusy = errors.New("credential account is at its in-flight limit")
 
+type AffinityMode uint8
+
+const (
+	AffinityNone AffinityMode = iota
+	AffinitySoft
+	AffinityHard
+)
+
+type Affinity struct {
+	Key  string
+	Mode AffinityMode
+}
+
 type PoolConfig struct {
 	Dir                string
 	Surface            string
@@ -61,14 +74,45 @@ type account struct {
 	cooldownCause string
 	disabled      bool
 	disableReason string
-	refreshMu     sync.Mutex
+	refreshOnce   sync.Once
+	refreshLock   chan struct{}
+	generation    atomic.Uint64
 	inflight      atomic.Int64
 }
+
+func (a *account) currentGeneration() uint64 {
+	if generation := a.generation.Load(); generation != 0 {
+		return generation
+	}
+	a.generation.CompareAndSwap(0, 1)
+	return a.generation.Load()
+}
+
+func (a *account) acquireRefresh(ctx context.Context) error {
+	a.refreshOnce.Do(func() {
+		a.refreshLock = make(chan struct{}, 1)
+		a.refreshLock <- struct{}{}
+	})
+	select {
+	case <-a.refreshLock:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (a *account) releaseRefresh() { a.refreshLock <- struct{}{} }
 
 func (a *account) available(now time.Time) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return !a.disabled && !now.Before(a.cooldownUntil) && a.credential != nil
+}
+
+func (a *account) requestUsable(now time.Time) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return !a.disabled && !now.Before(a.cooldownUntil) && a.credential != nil && a.credential.usable(now)
 }
 
 func (a *account) supportsModel(model string) bool {
@@ -120,6 +164,7 @@ type Pool struct {
 	affinity      *affinityCache
 	refreshSem    chan struct{}
 	capacityCh    chan struct{}
+	capacityMu    sync.Mutex
 	rebuildCh     chan struct{}
 	closed        chan struct{}
 	closeOnce     sync.Once
@@ -128,21 +173,31 @@ type Pool struct {
 }
 
 type Lease struct {
-	pool    *Pool
-	account *account
-	once    sync.Once
+	pool       *Pool
+	account    *account
+	credential *credential
+	generation uint64
+	once       sync.Once
+}
+
+func (p *Pool) newLease(a *account) *Lease {
+	a.mu.RLock()
+	cred := a.credential
+	generation := a.currentGeneration()
+	a.mu.RUnlock()
+	return &Lease{pool: p, account: a, credential: cred, generation: generation}
 }
 
 func (l *Lease) Session() Session {
-	cred, _, _ := l.account.snapshot()
-	if cred == nil {
+	if l.credential == nil {
 		return Session{}
 	}
-	return cred.session()
+	return l.credential.session()
 }
-func (l *Lease) AccountID() string { return l.account.id }
-func (l *Lease) AgentID() string   { return l.account.agentID }
-func (l *Lease) SessionID() string { return l.account.sessionID }
+func (l *Lease) AccountID() string  { return l.account.id }
+func (l *Lease) AgentID() string    { return l.account.agentID }
+func (l *Lease) SessionID() string  { return l.account.sessionID }
+func (l *Lease) Generation() uint64 { return l.generation }
 func (l *Lease) Release() {
 	if l == nil || l.account == nil {
 		return
@@ -178,7 +233,7 @@ func NewPool(ctx context.Context, cfg PoolConfig, client *http.Client) (*Pool, e
 	p := &Pool{
 		cfg: cfg, http: client, accounts: map[string]*account{}, files: map[string]fileEntry{},
 		states: map[string]accountState{}, affinity: newAffinityCache(cfg.AffinityTTL, cfg.AffinityMaxEntries),
-		refreshSem: make(chan struct{}, cfg.RefreshConcurrency), capacityCh: make(chan struct{}, 1),
+		refreshSem: make(chan struct{}, cfg.RefreshConcurrency), capacityCh: make(chan struct{}),
 		rebuildCh: make(chan struct{}, 1), closed: make(chan struct{}),
 	}
 	p.active.Store([]*account{})
@@ -212,22 +267,32 @@ func (p *Pool) Close() {
 	})
 }
 
-func (p *Pool) Acquire(ctx context.Context, affinity, model string, exclude map[string]struct{}) (*Lease, error) {
-	cacheKey := modelAffinityKey(affinity, model)
+func (p *Pool) Acquire(ctx context.Context, affinity Affinity, model string, exclude map[string]struct{}) (*Lease, error) {
+	cacheKey := modelAffinityKey(affinity.Key, model)
+	var refreshFailed map[string]struct{}
 	for {
-		if affinity != "" {
+		capacity := p.capacitySignal()
+		if affinity.Key != "" {
 			if id, ok := p.affinity.Get(cacheKey); ok {
-				lease, err := p.acquireID(ctx, id, model, exclude)
+				var lease *Lease
+				var err error
+				if affinity.Mode == AffinitySoft && !p.accountRequestUsable(id) {
+					err = errAccountBusy
+				} else {
+					lease, err = p.acquireID(ctx, id, model, exclude)
+				}
 				if err == nil {
 					return lease, nil
 				}
-				if errors.Is(err, errAccountBusy) {
-					if err := p.waitForCapacity(ctx); err != nil {
+				if errors.Is(err, errAccountBusy) && affinity.Mode == AffinityHard {
+					if err := p.waitForCapacity(ctx, capacity); err != nil {
 						return nil, err
 					}
 					continue
 				}
-				p.affinity.Delete(cacheKey)
+				if !errors.Is(err, errAccountBusy) {
+					p.affinity.Delete(cacheKey)
+				}
 			}
 		}
 		active := p.schedulingSnapshot(model)
@@ -243,27 +308,50 @@ func (p *Pool) Acquire(ctx context.Context, affinity, model string, exclude map[
 		}
 		start := int(p.cursor.Add(1)-1) % len(active)
 		saturated := false
-		for i := 0; i < len(active); i++ {
-			a := active[(start+i)%len(active)]
-			if _, skipped := exclude[a.id]; skipped || !a.available(time.Now()) || !a.supportsModel(model) {
-				continue
+		const schedulingChoices = 4
+		for batch := 0; batch < len(active); batch += schedulingChoices {
+			var selected *account
+			selectedInflight := int64(^uint64(0) >> 1)
+			selectedUsable := false
+			for offset := 0; offset < schedulingChoices && batch+offset < len(active); offset++ {
+				a := active[(start+batch+offset)%len(active)]
+				_, excluded := exclude[a.id]
+				_, failedRefresh := refreshFailed[a.id]
+				if excluded || failedRefresh || !a.available(time.Now()) || !a.supportsModel(model) {
+					continue
+				}
+				inflight := a.inflight.Load()
+				if p.cfg.AccountMaxInflight > 0 && inflight >= int64(p.cfg.AccountMaxInflight) {
+					saturated = true
+					continue
+				}
+				usable := a.requestUsable(time.Now())
+				if selected == nil || usable && !selectedUsable || usable == selectedUsable && inflight < selectedInflight {
+					selected, selectedInflight, selectedUsable = a, inflight, usable
+				}
 			}
-			if !a.tryAcquire(p.cfg.AccountMaxInflight) {
-				saturated = true
-				continue
+			if selected != nil {
+				if !selected.tryAcquire(p.cfg.AccountMaxInflight) {
+					saturated = true
+					continue
+				}
+				if err := p.ensureUsable(ctx, selected); err != nil {
+					selected.inflight.Add(-1)
+					p.notifyCapacity()
+					if refreshFailed == nil {
+						refreshFailed = make(map[string]struct{})
+					}
+					refreshFailed[selected.id] = struct{}{}
+					continue
+				}
+				if affinity.Key != "" {
+					p.affinity.Set(cacheKey, selected.id)
+				}
+				return p.newLease(selected), nil
 			}
-			if err := p.ensureFresh(ctx, a, false); err != nil {
-				a.inflight.Add(-1)
-				p.notifyCapacity()
-				continue
-			}
-			if affinity != "" {
-				p.affinity.Set(cacheKey, a.id)
-			}
-			return &Lease{pool: p, account: a}, nil
 		}
 		if saturated {
-			if err := p.waitForCapacity(ctx); err != nil {
+			if err := p.waitForCapacity(ctx, capacity); err != nil {
 				return nil, err
 			}
 			continue
@@ -273,6 +361,13 @@ func (p *Pool) Acquire(ctx context.Context, affinity, model string, exclude map[
 		}
 		return nil, p.unavailable()
 	}
+}
+
+func (p *Pool) accountRequestUsable(id string) bool {
+	p.mu.RLock()
+	a := p.accounts[id]
+	p.mu.RUnlock()
+	return a != nil && a.requestUsable(time.Now())
 }
 
 func (a *account) tryAcquire(limit int) bool {
@@ -292,15 +387,27 @@ func (a *account) tryAcquire(limit int) bool {
 }
 
 func (p *Pool) notifyCapacity() {
-	select {
-	case p.capacityCh <- struct{}{}:
-	default:
+	p.capacityMu.Lock()
+	if p.capacityCh != nil {
+		close(p.capacityCh)
 	}
+	p.capacityCh = make(chan struct{})
+	p.capacityMu.Unlock()
 }
 
-func (p *Pool) waitForCapacity(ctx context.Context) error {
+func (p *Pool) capacitySignal() <-chan struct{} {
+	p.capacityMu.Lock()
+	if p.capacityCh == nil {
+		p.capacityCh = make(chan struct{})
+	}
+	ch := p.capacityCh
+	p.capacityMu.Unlock()
+	return ch
+}
+
+func (p *Pool) waitForCapacity(ctx context.Context, capacity <-chan struct{}) error {
 	select {
-	case <-p.capacityCh:
+	case <-capacity:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -318,11 +425,12 @@ func (p *Pool) schedulingSnapshot(model string) []*account {
 
 func (p *Pool) AcquireAccount(ctx context.Context, id string) (*Lease, error) {
 	for {
+		capacity := p.capacitySignal()
 		lease, err := p.acquireID(ctx, id, "", nil)
 		if !errors.Is(err, errAccountBusy) {
 			return lease, err
 		}
-		if err := p.waitForCapacity(ctx); err != nil {
+		if err := p.waitForCapacity(ctx, capacity); err != nil {
 			return nil, err
 		}
 	}
@@ -341,11 +449,11 @@ func (p *Pool) AcquireAccountForMetadata(ctx context.Context, id string) (*Lease
 	if disabled {
 		return nil, ErrNoAuth
 	}
-	if err := p.ensureFresh(ctx, a, false); err != nil {
+	if err := p.ensureUsable(ctx, a); err != nil {
 		return nil, err
 	}
 	a.inflight.Add(1)
-	return &Lease{pool: p, account: a}, nil
+	return p.newLease(a), nil
 }
 
 func (p *Pool) acquireID(ctx context.Context, id, model string, exclude map[string]struct{}) (*Lease, error) {
@@ -361,17 +469,17 @@ func (p *Pool) acquireID(ctx context.Context, id, model string, exclude map[stri
 	if !a.tryAcquire(p.cfg.AccountMaxInflight) {
 		return nil, errAccountBusy
 	}
-	if err := p.ensureFresh(ctx, a, false); err != nil {
+	if err := p.ensureUsable(ctx, a); err != nil {
 		a.inflight.Add(-1)
 		p.notifyCapacity()
 		return nil, err
 	}
-	return &Lease{pool: p, account: a}, nil
+	return p.newLease(a), nil
 }
 
-func (p *Pool) Bind(affinity, model, accountID string) {
-	if affinity != "" && accountID != "" {
-		p.affinity.Set(modelAffinityKey(affinity, model), accountID)
+func (p *Pool) Bind(affinity Affinity, model, accountID string) {
+	if affinity.Key != "" && accountID != "" {
+		p.affinity.Set(modelAffinityKey(affinity.Key, model), accountID)
 	}
 }
 
@@ -453,8 +561,10 @@ func (p *Pool) UpdateModels(accountID string, models []string, updatedAt time.Ti
 	if a == nil {
 		return ErrNoAuth
 	}
-	a.refreshMu.Lock()
-	defer a.refreshMu.Unlock()
+	if err := a.acquireRefresh(context.Background()); err != nil {
+		return err
+	}
+	defer a.releaseRefresh()
 	cred, _, disabled := a.snapshot()
 	if cred == nil || disabled {
 		return ErrNoAuth
@@ -499,6 +609,19 @@ func (p *Pool) Refresh(ctx context.Context, accountID string) error {
 		return ErrNoAuth
 	}
 	return p.ensureFresh(ctx, a, true)
+}
+
+// RefreshIfUnchanged collapses concurrent 401 recovery for requests that used
+// the same credential generation. Once one caller refreshes the account, later
+// callers observe the new generation and reuse it without another OAuth call.
+func (p *Pool) RefreshIfUnchanged(ctx context.Context, accountID string, observedGeneration uint64) error {
+	p.mu.RLock()
+	a := p.accounts[accountID]
+	p.mu.RUnlock()
+	if a == nil {
+		return ErrNoAuth
+	}
+	return p.refreshCredential(ctx, a, true, observedGeneration, true)
 }
 
 func (p *Pool) MarkCooldown(accountID, reason string, duration time.Duration) {
@@ -641,9 +764,29 @@ func (p *Pool) warmup(ctx context.Context) error {
 	return fmt.Errorf("credential warmup: %w", last)
 }
 
+func (p *Pool) ensureUsable(ctx context.Context, a *account) error {
+	cred, _, disabled := a.snapshot()
+	if cred == nil || disabled {
+		return ErrNoAuth
+	}
+	if cred.usable(time.Now()) {
+		return nil
+	}
+	return p.ensureFresh(ctx, a, false)
+}
+
 func (p *Pool) ensureFresh(ctx context.Context, a *account, force bool) error {
-	a.refreshMu.Lock()
-	defer a.refreshMu.Unlock()
+	return p.refreshCredential(ctx, a, force, 0, false)
+}
+
+func (p *Pool) refreshCredential(ctx context.Context, a *account, force bool, observedGeneration uint64, compareGeneration bool) error {
+	if err := a.acquireRefresh(ctx); err != nil {
+		return err
+	}
+	defer a.releaseRefresh()
+	if compareGeneration && a.currentGeneration() != observedGeneration {
+		return nil
+	}
 	cred, _, disabled := a.snapshot()
 	if cred == nil || disabled {
 		return ErrNoAuth
@@ -674,6 +817,7 @@ func (p *Pool) ensureFresh(ctx context.Context, a *account, force bool) error {
 	}
 	a.mu.Lock()
 	a.credential = next
+	a.generation.Add(1)
 	a.disabled = false
 	a.disableReason = ""
 	keepCooldown := time.Now().Before(a.cooldownUntil) && a.cooldownCause != "" && a.cooldownCause != "refresh_backoff"
@@ -840,6 +984,7 @@ func (p *Pool) scan() error {
 			credentialChanged := existing.credential == nil || existing.credential.Path != cred.Path || existing.credential.AccessToken != cred.AccessToken || existing.credential.RefreshToken != cred.RefreshToken
 			existing.credential = cred
 			if credentialChanged {
+				existing.generation.Add(1)
 				poolChanged = true
 				existing.disabled = false
 				existing.disableReason = ""
@@ -851,6 +996,7 @@ func (p *Pool) scan() error {
 			continue
 		}
 		a := &account{id: id, credential: cred, agentID: randomHex(16), sessionID: randomUUID()}
+		a.generation.Store(1)
 		if state, ok := p.states[id]; ok {
 			if state.Disabled {
 				a.disabled, a.disableReason = true, state.Reason
