@@ -1,0 +1,26 @@
+services:
+  grokcli2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: grokcli2api-go:local
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      GROK2API_HOST: 0.0.0.0
+      GROK2API_PORT: ${GROK2API_PORT:-8088}
+      GROK_AUTHS_DIR: /auths
+    ports:
+      - "${GROK2API_PORT:-8088}:${GROK2API_PORT:-8088}"
+    volumes:
+      - ./auths:/auths
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null "http://127.0.0.1:$${GROK2API_PORT:-8088}/"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
