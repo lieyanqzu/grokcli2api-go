@@ -11,7 +11,7 @@ A lightweight, deployable Go compatibility layer with streaming and multi-accoun
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-663399.svg)](LICENSE)
 [![Container](https://img.shields.io/badge/GHCR-grokcli2api--go-2496ED?logo=docker&logoColor=white)](https://github.com/Futureppo/grokcli2api-go/pkgs/container/grokcli2api-go)
 
-[Quick Start](#quick-start) · [API Compatibility](#api-compatibility) · [Configuration](#configuration) · [Endpoints](#endpoints) · [Contributing](#development-and-contributing)
+[One-command deployment](#one-command-deployment-linux) · [Quick Start](#quick-start) · [API Compatibility](#api-compatibility) · [Configuration](#configuration) · [Endpoints](#endpoints) · [Contributing](#development-and-contributing)
 
 [简体中文](README.md) · **English**
 
@@ -69,6 +69,30 @@ The service is optimized for different subscription tiers, and each request is r
 The compatibility layer preserves commonly used request fields, response structures, and streaming events where possible, but it does not guarantee support for every parameter or behavior of the official APIs. When integrating through an API aggregation project such as New API, enable **passthrough** for all request parameters.
 
 ## Quick Start
+
+### One-command deployment (Linux)
+
+If Docker and Docker Compose v2 are already installed on the server, run:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Futureppo/grokcli2api-go/main/scripts/deploy.sh)
+```
+
+The script checks Docker, downloads the Compose configuration, creates a protected `.env` file and `auths/` directory, generates a random local API key, imports the OAuth JSON credential you select, and starts and verifies the service. Interactive runs prompt for the credential path. Existing installations retain their `.env` and credentials, so the same command also updates the container image.
+
+For unattended deployment, provide the inputs as environment variables:
+
+```bash
+AUTH_FILE=/root/account.json \
+GROK_API_KEYS='sk-change-this-to-a-strong-random-key' \
+INSTALL_DIR=/opt/grokcli2api-go \
+bash <(curl -fsSL https://raw.githubusercontent.com/Futureppo/grokcli2api-go/main/scripts/deploy.sh)
+```
+
+Optional variables include `GROK2API_PORT` (default `8088`), `INSTALL_DIR` (default `~/grokcli2api-go`), `AUTH_FILE`, and `GROK_API_KEYS`. Without a credential, the script initializes the protected configuration but does not start a service that cannot handle requests.
+
+> [!TIP]
+> The deployment script does not obtain upstream credentials for you. OAuth JSON is sensitive: export it only from a trusted source and store it with least-privilege permissions. Configure HTTPS, a reverse proxy, access controls, and rate limiting before exposing the service publicly.
 
 ### 1. Prepare the Project
 

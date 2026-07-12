@@ -11,7 +11,7 @@
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-663399.svg)](LICENSE)
 [![Container](https://img.shields.io/badge/GHCR-grokcli2api--go-2496ED?logo=docker&logoColor=white)](https://github.com/Futureppo/grokcli2api-go/pkgs/container/grokcli2api-go)
 
-[快速开始](#快速开始) · [API 兼容性](#api-兼容性) · [配置说明](#配置说明) · [接口一览](#接口一览) · [参与贡献](#开发与贡献)
+[一键部署](#一键部署linux) · [快速开始](#快速开始) · [API 兼容性](#api-兼容性) · [配置说明](#配置说明) · [接口一览](#接口一览) · [参与贡献](#开发与贡献)
 
 **简体中文** · [English](README_EN.md)
 
@@ -69,6 +69,30 @@ flowchart LR
 兼容层会尽可能保留常用的请求字段、响应结构和流式事件，但不保证覆盖官方 API 的全部参数与行为。接入 New API 等 API 聚合项目时，请开启所有请求参数的**透传**。
 
 ## 快速开始
+
+### 一键部署（Linux）
+
+服务器已安装 Docker 与 Docker Compose v2 时，可直接运行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Futureppo/grokcli2api-go/main/scripts/deploy.sh)
+```
+
+脚本会检查 Docker 环境、下载 Compose 配置、创建受保护的 `.env` 和 `auths/` 目录、生成随机本地 API Key、导入你指定的 OAuth JSON 凭证，并启动及验证服务。交互执行时按提示输入凭证文件路径即可；已有安装会保留 `.env` 与凭证，可用同一条命令完成镜像更新。
+
+无人值守部署可预先传入参数：
+
+```bash
+AUTH_FILE=/root/account.json \
+GROK_API_KEYS='sk-change-this-to-a-strong-random-key' \
+INSTALL_DIR=/opt/grokcli2api-go \
+bash <(curl -fsSL https://raw.githubusercontent.com/Futureppo/grokcli2api-go/main/scripts/deploy.sh)
+```
+
+可选变量包括 `GROK2API_PORT`（默认 `8088`）、`INSTALL_DIR`（默认 `~/grokcli2api-go`）、`AUTH_FILE` 与 `GROK_API_KEYS`。未提供凭证时，脚本只初始化安全配置而不会启动一个无法工作的服务。
+
+> [!TIP]
+> 一键脚本解决的是服务部署，不会替你获取上游凭证。OAuth JSON 属于敏感信息，请只从可信来源导出，并在服务器上以最小权限保存。正式对公网开放前还应配置 HTTPS、反向代理、访问控制和限流。
 
 ### 1. 准备项目
 
