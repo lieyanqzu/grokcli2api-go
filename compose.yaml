@@ -1,9 +1,6 @@
 services:
   grokcli2api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: grokcli2api-go:local
+    image: ghcr.io/futureppo/grokcli2api-go:latest
     restart: unless-stopped
     env_file:
       - path: .env
