@@ -98,6 +98,17 @@ docker run --rm -p 8088:8088 --env-file .env \
   -v "$(pwd)/auths:/auths" -e GROK_AUTHS_DIR=/auths grokcli2api-go
 ```
 
+也可以使用 Docker Compose 从当前源码构建并启动。现有 `.env` 和
+`auths/` 目录会继续作为外部配置与凭证数据使用，重建容器不会写入镜像：
+
+```bash
+docker compose up -d --build
+docker compose ps
+```
+
+如需使用预构建镜像，可通过 `GROK2API_IMAGE` 覆盖镜像标签，并省略
+`--build`。
+
 每次推送都会发布 `sha-<commit>` 和对应的分支标签；`main` 分支还会更新 `latest` 标签。
 
 ## 调用示例

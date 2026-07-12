@@ -96,6 +96,18 @@ docker run --rm -p 8088:8088 --env-file .env \
   -v "$(pwd)/auths:/auths" -e GROK_AUTHS_DIR=/auths grokcli2api-go
 ```
 
+You can also build and start the current source with Docker Compose. Existing
+`.env` and `auths/` remain external configuration and credential data, so
+recreating the container does not bake them into the image:
+
+```bash
+docker compose up -d --build
+docker compose ps
+```
+
+Set `GROK2API_IMAGE` to override the image tag when using a prebuilt image and
+omit `--build`.
+
 Every push publishes a `sha-<commit>` tag and a matching branch tag. Pushes to `main` also update `latest`.
 
 ## Usage examples
