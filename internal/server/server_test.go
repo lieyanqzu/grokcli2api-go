@@ -707,17 +707,25 @@ func TestResponsesConvertsNamespaceToolsAndRestoresCall(t *testing.T) {
 	}
 }
 
-func TestResponsesRejectsUnknownInputBeforeUpstream(t *testing.T) {
+func TestResponsesDropsUnknownInputBeforeUpstream(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		w.WriteHeader(http.StatusOK)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if input := body["input"].([]any); len(input) != 0 {
+			t.Fatalf("input=%#v", input)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"output": []any{}})
 	}))
 	defer upstream.Close()
 	h := newTestHandler(t, upstream.URL, nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":[{"type":"future_item"}]}`)))
-	if rec.Code != http.StatusUnprocessableEntity || calls.Load() != 0 || !strings.Contains(rec.Body.String(), "input[0]") {
+	if rec.Code != http.StatusOK || calls.Load() != 1 {
 		t.Fatalf("status=%d calls=%d body=%s", rec.Code, calls.Load(), rec.Body.String())
 	}
 }

@@ -68,13 +68,17 @@ func String(body map[string]any, key, fallback string) string {
 func PrepareChat(body map[string]any) map[string]any {
 	out := clone(body)
 	out["stream"] = IsStreaming(body)
-	if rejectsCompatibilityParameters(body) {
+	if IsStrictCompatibilityModel(String(body, "model", "")) {
 		// These models reject the OpenAI sampling penalty, while older
 		// upstream models may still accept it. Handle both spellings so
 		// OpenAI-compatible and direct clients behave consistently.
 		delete(out, "presence_penalty")
 		delete(out, "presencePenalty")
+		delete(out, "frequency_penalty")
+		delete(out, "frequencyPenalty")
+		delete(out, "stop")
 	}
+	normalizeReasoning(out, false)
 	return out
 }
 
@@ -84,12 +88,18 @@ func PrepareResponses(body map[string]any) map[string]any {
 	out := clone(body)
 	out["model"] = UpstreamModel(String(body, "model", ""))
 	out["stream"] = IsStreaming(body)
-	if rejectsCompatibilityParameters(body) {
+	if IsStrictCompatibilityModel(String(body, "model", "")) {
 		// Codex clients may send this extension, but these models do not
 		// expose the corresponding Responses API argument.
 		delete(out, "external_web_access")
 		delete(out, "externalWebAccess")
+		delete(out, "presence_penalty")
+		delete(out, "presencePenalty")
+		delete(out, "frequency_penalty")
+		delete(out, "frequencyPenalty")
+		delete(out, "stop")
 	}
+	normalizeReasoning(out, true)
 	if _, ok := out["input"]; !ok {
 		if messages, legacy := out["messages"]; legacy {
 			out["input"] = messages
@@ -118,12 +128,54 @@ func PrepareResponses(body map[string]any) map[string]any {
 	return out
 }
 
-func rejectsCompatibilityParameters(body map[string]any) bool {
-	switch strings.ToLower(strings.TrimSpace(String(body, "model", ""))) {
-	case "grok-4.5", "composer":
-		return true
+// IsStrictCompatibilityModel reports models whose Grok CLI endpoint rejects
+// optional OpenAI sampling and stopping parameters. Composer model IDs are
+// versioned, so match the family instead of a single alias.
+func IsStrictCompatibilityModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return model == "composer" || strings.HasPrefix(model, "grok-composer-") ||
+		model == "grok-4.5" || strings.HasPrefix(model, "grok-4.5-")
+}
+
+func normalizeReasoning(body map[string]any, responses bool) {
+	effort := ""
+	if reasoning, ok := body["reasoning"].(map[string]any); ok {
+		effort = normalizeReasoningEffort(String(reasoning, "effort", ""))
+		if effort != "" {
+			copy := clone(reasoning)
+			copy["effort"] = effort
+			body["reasoning"] = copy
+		}
+	}
+	if effort == "" {
+		effort = normalizeReasoningEffort(String(body, "reasoning_effort", ""))
+	}
+	if effort == "" {
+		return
+	}
+	if responses {
+		if _, ok := body["reasoning"]; !ok {
+			body["reasoning"] = map[string]any{"effort": effort}
+		}
+		delete(body, "reasoning_effort")
+		return
+	}
+	body["reasoning_effort"] = effort
+}
+
+func normalizeReasoningEffort(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "":
+		return ""
+	case "none", "minimal", "low":
+		return "low"
+	case "adaptive", "medium":
+		return "medium"
+	case "high", "xhigh":
+		return "high"
 	default:
-		return false
+		return "medium"
 	}
 }
 

@@ -1,6 +1,8 @@
 services:
   grokcli2api:
-    image: ghcr.io/futureppo/grokcli2api-go:latest
+    image: ${GROK2API_IMAGE:-grokcli2api-go:local}
+    build:
+      context: .
     restart: unless-stopped
     env_file:
       - path: .env
@@ -12,7 +14,15 @@ services:
     ports:
       - "${GROK2API_PORT:-8088}:${GROK2API_PORT:-8088}"
     volumes:
-      - ./auths:/auths
+      - ./auths:/auths:rw
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
     healthcheck:
       test:
         - CMD-SHELL

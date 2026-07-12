@@ -47,6 +47,22 @@ func TestPrepareChatStripsUnsupportedComposerPresencePenalty(t *testing.T) {
 	}
 }
 
+func TestPrepareChatNormalizesStrictComposerParameters(t *testing.T) {
+	out := PrepareChat(map[string]any{
+		"model": "grok-composer-2.5-fast", "stop": []any{"done"},
+		"frequency_penalty": float64(0.2), "frequencyPenalty": float64(0.2),
+		"reasoning_effort": "adaptive",
+	})
+	for _, key := range []string{"stop", "frequency_penalty", "frequencyPenalty"} {
+		if _, ok := out[key]; ok {
+			t.Fatalf("%s was forwarded: %#v", key, out)
+		}
+	}
+	if out["reasoning_effort"] != "medium" {
+		t.Fatalf("reasoning_effort = %#v", out["reasoning_effort"])
+	}
+}
+
 func TestPrepareResponsesPreservesModel(t *testing.T) {
 	body := map[string]any{"model": "grok-4.5", "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "stream": true}
 	out := PrepareResponses(body)
@@ -93,6 +109,29 @@ func TestPrepareResponsesStripsUnsupportedComposerExternalWebAccess(t *testing.T
 	}
 	if _, ok := out["externalWebAccess"]; ok {
 		t.Fatal("externalWebAccess was forwarded to composer")
+	}
+}
+
+func TestPrepareResponsesCanonicalizesReasoningEffort(t *testing.T) {
+	out := PrepareResponses(map[string]any{
+		"model": "grok-4.5", "input": "hello", "reasoning_effort": "xhigh",
+	})
+	if _, ok := out["reasoning_effort"]; ok {
+		t.Fatalf("legacy reasoning_effort leaked: %#v", out)
+	}
+	reasoning, ok := out["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "high" {
+		t.Fatalf("reasoning = %#v", out["reasoning"])
+	}
+}
+
+func TestPrepareResponsesFallsBackUnknownReasoningEffort(t *testing.T) {
+	out := PrepareResponses(map[string]any{
+		"model": "grok-4.5", "input": "hello", "reasoning_effort": "vendor-adaptive",
+	})
+	reasoning, ok := out["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "medium" {
+		t.Fatalf("reasoning = %#v", out["reasoning"])
 	}
 }
 

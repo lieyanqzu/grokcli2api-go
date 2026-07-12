@@ -103,12 +103,75 @@ func TestPrepareCompatibleResponsesRewritesCodexInputItems(t *testing.T) {
 	}
 }
 
-func TestPrepareCompatibleResponsesRejectsUnknownInput(t *testing.T) {
-	_, _, err := PrepareCompatibleResponses(map[string]any{
-		"model": "grok-4.5", "input": []any{map[string]any{"type": "future_item"}},
+func TestPrepareCompatibleResponsesDropsUnknownInput(t *testing.T) {
+	wire, _, err := PrepareCompatibleResponses(map[string]any{
+		"model": "grok-4.5", "input": []any{
+			map[string]any{"type": "future_item"},
+			map[string]any{"type": "message", "role": "user", "phase": "commentary", "internal_chat_message_metadata_passthrough": map[string]any{"turn_id": "turn-1"}, "content": []any{map[string]any{"type": "input_text", "text": "hello"}}},
+		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "input[0]") || !strings.Contains(err.Error(), "future_item") {
-		t.Fatalf("error = %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := wire["input"].([]any)
+	if len(input) != 1 {
+		t.Fatalf("input = %#v", input)
+	}
+	message := input[0].(map[string]any)
+	if _, ok := message["phase"]; ok {
+		t.Fatalf("phase leaked upstream: %#v", message)
+	}
+	if _, ok := message["internal_chat_message_metadata_passthrough"]; ok {
+		t.Fatalf("internal metadata leaked upstream: %#v", message)
+	}
+}
+
+func TestPrepareCompatibleResponsesNormalizesCodexHostedTools(t *testing.T) {
+	wire, _, err := PrepareCompatibleResponses(map[string]any{
+		"model": "grok-4.5", "input": "hello",
+		"tool_choice": map[string]any{"type": "image_generation"},
+		"tools": []any{
+			map[string]any{
+				"type": "web_search", "external_web_access": true, "indexed_web_access": true,
+				"search_content_types": []any{"text"}, "search_context_size": "high",
+				"filters": map[string]any{"allowed_domains": []any{"a.test", "b.test", "c.test", "d.test", "e.test", "f.test"}},
+			},
+			map[string]any{"type": "image_generation", "quality": "auto"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := wire["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools = %#v", tools)
+	}
+	web := tools[0].(map[string]any)
+	for _, key := range []string{"external_web_access", "indexed_web_access", "search_content_types", "search_context_size", "filters"} {
+		if _, ok := web[key]; ok {
+			t.Fatalf("%s leaked upstream: %#v", key, web)
+		}
+	}
+	if domains := web["allowed_domains"].([]any); len(domains) != 5 {
+		t.Fatalf("allowed_domains = %#v", domains)
+	}
+	if wire["tool_choice"] != "auto" {
+		t.Fatalf("tool_choice = %#v", wire["tool_choice"])
+	}
+}
+
+func TestPrepareCompatibleResponsesDropsEncryptedAgentMessage(t *testing.T) {
+	wire, _, err := PrepareCompatibleResponses(map[string]any{
+		"model": "grok-4.5", "input": []any{
+			map[string]any{"type": "agent_message", "author": "worker", "recipient": "root", "content": []any{map[string]any{"type": "encrypted_text", "encrypted_content": "opaque"}}},
+			map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "continue"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if input := wire["input"].([]any); len(input) != 1 || String(input[0].(map[string]any), "type", "") != "message" {
+		t.Fatalf("input = %#v", input)
 	}
 }
 

@@ -107,9 +107,9 @@ func (c *ResponsesCompatibility) normalizeInputItem(raw any, index int) (any, []
 	}
 	switch kind {
 	case "message", "reasoning", "function_call_output", "web_search_call", "compaction", "context_compaction":
-		return item, nil, nil
+		return sanitizeInputItem(item), nil, nil
 	case "function_call":
-		out := clone(item)
+		out := sanitizeInputItem(item)
 		identity := toolIdentity{Kind: functionTool, Name: String(item, "name", ""), Namespace: String(item, "namespace", "")}
 		if identity.Name == "" {
 			return nil, nil, fmt.Errorf("input[%d] function_call is missing name", index)
@@ -129,7 +129,7 @@ func (c *ResponsesCompatibility) normalizeInputItem(raw any, index int) (any, []
 		}
 		return message, toolSources(item["tools"], true), nil
 	case "custom_tool_call":
-		out := clone(item)
+		out := sanitizeInputItem(item)
 		identity := toolIdentity{Kind: customTool, Name: String(item, "name", ""), Namespace: String(item, "namespace", "")}
 		if identity.Name == "" {
 			return nil, nil, fmt.Errorf("input[%d] custom_tool_call is missing name", index)
@@ -141,14 +141,17 @@ func (c *ResponsesCompatibility) normalizeInputItem(raw any, index int) (any, []
 		delete(out, "input")
 		return out, nil, nil
 	case "custom_tool_call_output":
-		out := clone(item)
+		out := sanitizeInputItem(item)
 		out["type"] = "function_call_output"
 		delete(out, "name")
 		return out, nil, nil
 	case "agent_message":
 		content, ok := agentMessageContent(item["content"])
 		if !ok {
-			return nil, nil, fmt.Errorf("input[%d] agent_message contains encrypted or invalid content", index)
+			// Codex may persist an encrypted-only inter-agent item that the
+			// Grok endpoint cannot decrypt. Drop it so the rest of the usable
+			// conversation can continue.
+			return nil, nil, nil
 		}
 		label := strings.TrimSpace(String(item, "author", "agent") + " -> " + String(item, "recipient", "recipient"))
 		return map[string]any{
@@ -174,10 +177,20 @@ func (c *ResponsesCompatibility) normalizeInputItem(raw any, index int) (any, []
 			"content": []any{map[string]any{"type": "input_text", "text": "MCP tool output for call " + String(item, "call_id", "unknown") + ": " + string(payload)}},
 		}, nil, nil
 	case "compaction_trigger":
-		return nil, nil, fmt.Errorf("input[%d] type compaction_trigger is not supported by the upstream", index)
+		return nil, nil, nil
 	default:
-		return nil, nil, fmt.Errorf("unsupported input item type at input[%d]: %s", index, kind)
+		// New Codex clients can add optional history item types before the
+		// Grok CLI endpoint supports them. Omitting an unknown optional item
+		// is preferable to rejecting the whole turn.
+		return nil, nil, nil
 	}
+}
+
+func sanitizeInputItem(item map[string]any) map[string]any {
+	out := clone(item)
+	delete(out, "internal_chat_message_metadata_passthrough")
+	delete(out, "phase")
+	return out
 }
 
 func toolSources(raw any, force bool) []toolSource {
@@ -290,11 +303,18 @@ func (c *ResponsesCompatibility) normalizeToolSources(sources []toolSource) ([]a
 				},
 			})
 			return nil
-		case "web_search", "x_search", "collections_search", "file_search", "code_execution", "code_interpreter", "mcp", "shell":
+		case "web_search":
+			add(normalizeWebSearchTool(tool))
+			return nil
+		case "image_generation":
+			// Grok CLI has no equivalent image generation tool. Codex treats
+			// it as optional, so omit it and continue with the remaining tools.
+			return nil
+		case "x_search", "collections_search", "file_search", "code_execution", "code_interpreter", "mcp", "shell":
 			add(clone(tool))
 			return nil
 		default:
-			return fmt.Errorf("unsupported tool type: %s", kind)
+			return nil
 		}
 	}
 
@@ -340,6 +360,37 @@ func describeDeferred(namespace, name, description string) string {
 	return full + ": " + description
 }
 
+func normalizeWebSearchTool(tool map[string]any) map[string]any {
+	out := clone(tool)
+	delete(out, "external_web_access")
+	delete(out, "indexed_web_access")
+	delete(out, "search_content_types")
+	delete(out, "search_context_size")
+
+	if filters, ok := tool["filters"].(map[string]any); ok {
+		for _, key := range []string{"allowed_domains", "blocked_domains"} {
+			if domains, exists := filters[key]; exists {
+				out[key] = limitDomains(domains, 5)
+			}
+		}
+		delete(out, "filters")
+	}
+	for _, key := range []string{"allowed_domains", "blocked_domains"} {
+		if domains, exists := out[key]; exists {
+			out[key] = limitDomains(domains, 5)
+		}
+	}
+	return out
+}
+
+func limitDomains(value any, limit int) any {
+	domains, ok := value.([]any)
+	if !ok || len(domains) <= limit {
+		return value
+	}
+	return append([]any(nil), domains[:limit]...)
+}
+
 func (c *ResponsesCompatibility) alias(identity toolIdentity) string {
 	key := identity.key()
 	if alias, ok := c.originalAliases[key]; ok {
@@ -376,6 +427,10 @@ func shortHash(value string) string {
 func (c *ResponsesCompatibility) normalizeToolChoice(body map[string]any) {
 	choice, ok := body["tool_choice"].(map[string]any)
 	if !ok {
+		return
+	}
+	if String(choice, "type", "") == "image_generation" {
+		body["tool_choice"] = "auto"
 		return
 	}
 	name := String(choice, "name", "")
@@ -440,10 +495,15 @@ func agentMessageContent(raw any) (string, bool) {
 	parts := make([]string, 0, len(items))
 	for _, rawItem := range items {
 		item, ok := rawItem.(map[string]any)
-		if !ok || String(item, "type", "") != "input_text" {
+		if !ok {
 			return "", false
 		}
-		parts = append(parts, String(item, "text", ""))
+		switch String(item, "type", "") {
+		case "input_text", "text":
+			parts = append(parts, String(item, "text", ""))
+		default:
+			return "", false
+		}
 	}
 	return strings.Join(parts, "\n"), true
 }

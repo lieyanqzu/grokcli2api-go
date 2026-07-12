@@ -63,7 +63,7 @@ func Prepare(body map[string]any) (Prepared, error) {
 			out[key] = value
 		}
 	}
-	if stops, ok := body["stop_sequences"]; ok {
+	if stops, ok := body["stop_sequences"]; ok && !openai.IsStrictCompatibilityModel(stringValue(body["model"])) {
 		out["stop"] = stops
 	}
 	if tools, ok := body["tools"].([]any); ok {
@@ -281,6 +281,9 @@ func convertTools(tools []any) ([]any, error) {
 			converted := map[string]any{"type": "web_search"}
 			for _, key := range []string{"max_uses", "allowed_domains", "blocked_domains", "user_location"} {
 				if value, ok := tool[key]; ok {
+					if key == "allowed_domains" || key == "blocked_domains" {
+						value = limitDomains(value, 5)
+					}
 					converted[key] = value
 				}
 			}
@@ -382,6 +385,14 @@ func convertMCPServers(servers []any) ([]any, error) {
 		out = append(out, converted)
 	}
 	return out, nil
+}
+
+func limitDomains(value any, limit int) any {
+	domains, ok := value.([]any)
+	if !ok || len(domains) <= limit {
+		return value
+	}
+	return append([]any(nil), domains[:limit]...)
 }
 
 func NormalizeResponse(raw map[string]any, fallbackModel string) map[string]any {

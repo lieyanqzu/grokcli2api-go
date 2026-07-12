@@ -111,6 +111,28 @@ func TestPreparePreservesAnthropicWebSearchTool(t *testing.T) {
 	}
 }
 
+func TestPrepareStrictComposerDropsStopAndCapsDomains(t *testing.T) {
+	prepared, err := Prepare(map[string]any{
+		"model": "grok-composer-2.5-fast", "max_tokens": float64(128),
+		"messages":       []any{map[string]any{"role": "user", "content": "search"}},
+		"stop_sequences": []any{"done"},
+		"tools": []any{map[string]any{
+			"type": "web_search_20250305", "name": "web_search",
+			"allowed_domains": []any{"a.test", "b.test", "c.test", "d.test", "e.test", "f.test"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := prepared.Body["stop"]; ok {
+		t.Fatalf("stop leaked upstream: %#v", prepared.Body)
+	}
+	tool := prepared.Body["tools"].([]any)[0].(map[string]any)
+	if domains := tool["allowed_domains"].([]any); len(domains) != 5 {
+		t.Fatalf("allowed_domains = %#v", domains)
+	}
+}
+
 func TestNormalizeUpstreamToolsInfersOrRejectsMissingType(t *testing.T) {
 	body := map[string]any{"tools": []any{map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}}}
 	if err := normalizeUpstreamTools(body); err != nil {
