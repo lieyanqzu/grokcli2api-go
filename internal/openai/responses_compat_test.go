@@ -175,6 +175,51 @@ func TestPrepareCompatibleResponsesDropsEncryptedAgentMessage(t *testing.T) {
 	}
 }
 
+func TestPrepareCompatibleResponsesDropsNonPortableEncryptedReasoning(t *testing.T) {
+	wire, compat, err := PrepareCompatibleResponses(map[string]any{
+		"model":   "grok-4.5",
+		"include": []any{"reasoning.encrypted_content", "web_search_call.action.sources"},
+		"input": []any{
+			map[string]any{"type": "reasoning", "id": "rs_encrypted", "summary": []any{}, "encrypted_content": "opaque-only"},
+			map[string]any{"type": "compaction", "id": "cmp_1", "encrypted_content": "opaque-compaction"},
+			map[string]any{"type": "reasoning", "id": "rs_summary", "summary": []any{map[string]any{"type": "summary_text", "text": "usable"}}, "encrypted_content": "opaque-with-summary"},
+			map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "continue"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	includes := wire["include"].([]any)
+	if len(includes) != 1 || includes[0] != "web_search_call.action.sources" {
+		t.Fatalf("include = %#v", includes)
+	}
+	input := wire["input"].([]any)
+	if len(input) != 2 {
+		t.Fatalf("input = %#v", input)
+	}
+	reasoning := input[0].(map[string]any)
+	if reasoning["id"] != "rs_summary" || reasoning["encrypted_content"] != nil {
+		t.Fatalf("reasoning = %#v", reasoning)
+	}
+
+	response := compat.NormalizeResponse(map[string]any{"output": []any{
+		map[string]any{"type": "reasoning", "summary": []any{}, "encrypted_content": "new-opaque"},
+	}}, "grok-4.5")
+	responseReasoning := response["output"].([]any)[0].(map[string]any)
+	if _, ok := responseReasoning["encrypted_content"]; ok {
+		t.Fatalf("response reasoning leaked encrypted_content: %#v", responseReasoning)
+	}
+
+	streamed := translateOne(t, compat, "response.output_item.added", map[string]any{
+		"type": "response.output_item.added", "output_index": 0,
+		"item": map[string]any{"type": "reasoning", "summary": []any{}, "encrypted_content": "stream-opaque"},
+	})
+	streamReasoning := streamed["item"].(map[string]any)
+	if _, ok := streamReasoning["encrypted_content"]; ok {
+		t.Fatalf("stream reasoning leaked encrypted_content: %#v", streamReasoning)
+	}
+}
+
 func TestResponsesCompatibilityRestoresNamespacedAndCustomCalls(t *testing.T) {
 	body := map[string]any{
 		"model": "grok-4.5", "input": "hello",

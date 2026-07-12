@@ -57,6 +57,7 @@ type StreamEvent struct {
 // shapes to the subset understood by the Grok CLI upstream.
 func PrepareCompatibleResponses(body map[string]any) (map[string]any, *ResponsesCompatibility, error) {
 	out := PrepareResponses(body)
+	removeEncryptedReasoningInclude(out)
 	compat := &ResponsesCompatibility{
 		aliases:         make(map[string]toolIdentity),
 		originalAliases: make(map[string]string),
@@ -106,8 +107,19 @@ func (c *ResponsesCompatibility) normalizeInputItem(raw any, index int) (any, []
 		return item, nil, nil
 	}
 	switch kind {
-	case "message", "reasoning", "function_call_output", "web_search_call", "compaction", "context_compaction":
+	case "message", "function_call_output", "web_search_call":
 		return sanitizeInputItem(item), nil, nil
+	case "reasoning":
+		out := sanitizeInputItem(item)
+		delete(out, "encrypted_content")
+		if !hasReasoningText(out) {
+			return nil, nil, nil
+		}
+		return out, nil, nil
+	case "compaction", "context_compaction":
+		// These items contain an opaque encrypted state produced by another
+		// backend account. It is not portable across the Grok credential pool.
+		return nil, nil, nil
 	case "function_call":
 		out := sanitizeInputItem(item)
 		identity := toolIdentity{Kind: functionTool, Name: String(item, "name", ""), Namespace: String(item, "namespace", "")}
@@ -191,6 +203,34 @@ func sanitizeInputItem(item map[string]any) map[string]any {
 	delete(out, "internal_chat_message_metadata_passthrough")
 	delete(out, "phase")
 	return out
+}
+
+func hasReasoningText(item map[string]any) bool {
+	for _, key := range []string{"summary", "content"} {
+		if parts, ok := item[key].([]any); ok && len(parts) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func removeEncryptedReasoningInclude(body map[string]any) {
+	includes, ok := body["include"].([]any)
+	if !ok {
+		return
+	}
+	filtered := make([]any, 0, len(includes))
+	for _, include := range includes {
+		if value, _ := include.(string); value == "reasoning.encrypted_content" {
+			continue
+		}
+		filtered = append(filtered, include)
+	}
+	if len(filtered) == 0 {
+		delete(body, "include")
+		return
+	}
+	body["include"] = filtered
 }
 
 func toolSources(raw any, force bool) []toolSource {
@@ -531,8 +571,11 @@ func (c *ResponsesCompatibility) rewriteValue(value any) any {
 		for key, item := range typed {
 			out[key] = c.rewriteValue(item)
 		}
-		if String(out, "type", "") == "function_call" {
+		switch String(out, "type", "") {
+		case "function_call":
 			c.rewriteCall(out)
+		case "reasoning", "compaction", "context_compaction":
+			delete(out, "encrypted_content")
 		}
 		return out
 	default:
@@ -599,6 +642,7 @@ func (c *ResponsesCompatibility) TranslateStream(event string, data []byte) ([]S
 				c.rewriteCall(item)
 			}
 		}
+		payload = c.rewriteValue(payload).(map[string]any)
 	case "response.function_call_arguments.delta":
 		identity, state, found := c.streamIdentity(payload)
 		if found && (identity.Kind == customTool || identity.Kind == toolSearchTool) {
