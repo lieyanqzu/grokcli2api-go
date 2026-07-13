@@ -731,15 +731,15 @@ func TestResponsesDefaultsToOpenAIFormat(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		if body["input"] != "hello" || body["model"] != "grok-4" || body["store"] != false {
+		if body["input"] != "hello" || body["model"] != "grok-4" || body["store"] != false || body["grok_extension"] != nil {
 			t.Fatalf("wire=%#v", body)
 		}
-		writeJSON(w, 200, map[string]any{"id": "resp_1", "object": "response", "status": "completed", "output": []any{}})
+		writeJSON(w, 200, map[string]any{"id": "resp_1", "object": "response", "status": "completed", "output": []any{}, "grok_field": "hidden"})
 	}))
 	defer upstream.Close()
 	h := newTestHandler(t, upstream.URL, nil)
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":"hello"}`)))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4","input":"hello","grok_extension":"drop"}`)))
 	if rec.Code != 200 {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -750,6 +750,9 @@ func TestResponsesDefaultsToOpenAIFormat(t *testing.T) {
 	}
 	if _, exists := response["choices"]; exists {
 		t.Fatal("response was incorrectly normalized as chat completion")
+	}
+	if _, exists := response["grok_field"]; exists {
+		t.Fatalf("Grok-native field leaked into default response: %#v", response)
 	}
 }
 
@@ -853,9 +856,38 @@ func TestResponsesGrokBuildClientUsesNativePassThrough(t *testing.T) {
 	}
 }
 
+func TestGrokCLIClientDetectionRequiresRecognizedIdentity(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers map[string]string
+		want    bool
+	}{
+		{name: "ordinary OpenAI client", headers: map[string]string{"User-Agent": "OpenAI/Python 2.0"}},
+		{name: "unrecognized Grok header value", headers: map[string]string{"x-grok-client-name": "third-party-dashboard"}},
+		{name: "surface alone", headers: map[string]string{"x-grok-client-surface": "tui"}},
+		{name: "token auth", headers: map[string]string{"X-XAI-Token-Auth": "xai-grok-cli"}, want: true},
+		{name: "CLI version", headers: map[string]string{"x-grok-client-version": "0.2.99"}, want: true},
+		{name: "CLI name", headers: map[string]string{"x-grok-client-name": "grok-shell"}, want: true},
+		{name: "CLI identifier", headers: map[string]string{"x-grok-client-identifier": "grok-cli"}, want: true},
+		{name: "current CLI user agent", headers: map[string]string{"User-Agent": "grok-cli/0.2.99 (windows; amd64)"}, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			for key, value := range test.headers {
+				req.Header.Set(key, value)
+			}
+			if got := isGrokCLIClient(req); got != test.want {
+				t.Fatalf("isGrokCLIClient = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestResponsesStreamPreservesEventsWithoutDone(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: grok.custom\ndata: {\"type\":\"grok.custom\",\"value\":1}\n\n")
 		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n")
 		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\ndata: [DONE]\n\n")
 	}))
@@ -869,6 +901,9 @@ func TestResponsesStreamPreservesEventsWithoutDone(t *testing.T) {
 	}
 	if strings.Contains(text, "[DONE]") {
 		t.Fatalf("OpenAI Responses stream must not append DONE: %s", text)
+	}
+	if strings.Contains(text, "grok.custom") {
+		t.Fatalf("Grok-native event leaked into default stream: %s", text)
 	}
 }
 

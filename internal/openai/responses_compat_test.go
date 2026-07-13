@@ -134,7 +134,8 @@ func TestPrepareCompatibleResponsesNormalizesCodexHostedTools(t *testing.T) {
 			map[string]any{
 				"type": "web_search", "external_web_access": true, "indexed_web_access": true,
 				"search_content_types": []any{"text"}, "search_context_size": "high",
-				"filters": map[string]any{"allowed_domains": []any{"a.test", "b.test", "c.test", "d.test", "e.test", "f.test"}},
+				"user_location": map[string]any{"type": "approximate", "country": "CN"},
+				"filters":       map[string]any{"allowed_domains": []any{"a.test", "b.test", "c.test", "d.test", "e.test", "f.test"}},
 			},
 			map[string]any{"type": "image_generation", "quality": "auto"},
 		},
@@ -143,19 +144,24 @@ func TestPrepareCompatibleResponsesNormalizesCodexHostedTools(t *testing.T) {
 		t.Fatal(err)
 	}
 	tools := wire["tools"].([]any)
-	if len(tools) != 1 {
+	if len(tools) != 2 {
 		t.Fatalf("tools = %#v", tools)
 	}
 	web := tools[0].(map[string]any)
-	for _, key := range []string{"external_web_access", "indexed_web_access", "search_content_types", "search_context_size", "filters"} {
+	for _, key := range []string{"external_web_access", "indexed_web_access", "search_content_types", "filters", "allowed_domains"} {
 		if _, ok := web[key]; ok {
 			t.Fatalf("%s leaked upstream: %#v", key, web)
 		}
 	}
-	if domains := web["allowed_domains"].([]any); len(domains) != 5 {
-		t.Fatalf("allowed_domains = %#v", domains)
+	if web["search_context_size"] != "high" || web["user_location"] == nil {
+		t.Fatalf("web search fields = %#v", web)
 	}
-	if wire["tool_choice"] != "auto" {
+	image := tools[1].(map[string]any)
+	if image["type"] != "image_generation" || image["quality"] != "auto" {
+		t.Fatalf("image tool = %#v", image)
+	}
+	choice, ok := wire["tool_choice"].(map[string]any)
+	if !ok || choice["type"] != "image_generation" {
 		t.Fatalf("tool_choice = %#v", wire["tool_choice"])
 	}
 }
@@ -399,4 +405,21 @@ func translate(t *testing.T, compat *ResponsesCompatibility, event string, paylo
 		t.Fatal(err)
 	}
 	return events
+}
+
+func TestTranslateStreamDropsNativeEventsAndFiltersNestedResponse(t *testing.T) {
+	compat := &ResponsesCompatibility{
+		aliases: map[string]toolIdentity{}, originalAliases: map[string]string{}, streamCalls: map[string]*streamToolCall{},
+	}
+	if events := translate(t, compat, "grok.custom", map[string]any{"type": "grok.custom", "value": true}); len(events) != 0 {
+		t.Fatalf("native event leaked: %#v", events)
+	}
+	completed := translateOne(t, compat, "response.completed", map[string]any{
+		"type":     "response.completed",
+		"response": map[string]any{"id": "resp_1", "object": "response", "status": "completed", "output": []any{}, "grok_field": true},
+	})
+	response := completed["response"].(map[string]any)
+	if _, ok := response["grok_field"]; ok {
+		t.Fatalf("native response field leaked: %#v", response)
+	}
 }

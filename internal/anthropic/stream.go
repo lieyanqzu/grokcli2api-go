@@ -77,7 +77,8 @@ func (t *StreamTranslator) Handle(upstream grok.SSEEvent) ([]Event, error) {
 			if block := t.blocks[key]; block != nil {
 				block.Arguments, _ = item["arguments"].(string)
 			}
-		case "web_search_call", "file_search_call", "code_interpreter_call", "computer_call", "mcp_call":
+		case "web_search_call", "file_search_call", "code_interpreter_call", "computer_call", "mcp_call",
+			"image_generation_call", "local_shell_call", "shell_call", "apply_patch_call", "mcp_list_tools":
 			t.stopReason = "tool_use"
 			events = append(events, t.openBlock(key, "server_tool_use", map[string]any{"type": "server_tool_use", "id": itemID(item), "name": itemKind, "input": item["action"]})...)
 		}
@@ -135,13 +136,20 @@ func (t *StreamTranslator) Handle(upstream grok.SSEEvent) ([]Event, error) {
 	case "response.output_item.done":
 		item, _ := data["item"].(map[string]any)
 		key := eventKey(data, item)
-		if block := t.blocks[key]; block != nil && block.Kind == "tool_use" && !block.SentArgs {
-			args := block.Arguments
-			if args == "" {
-				args, _ = item["arguments"].(string)
+		if block := t.blocks[key]; block != nil {
+			if block.Kind == "tool_use" && !block.SentArgs {
+				args := block.Arguments
+				if args == "" {
+					args, _ = item["arguments"].(string)
+				}
+				if args != "" {
+					events = append(events, t.delta(key, map[string]any{"type": "input_json_delta", "partial_json": args})...)
+				}
 			}
-			if args != "" {
-				events = append(events, t.delta(key, map[string]any{"type": "input_json_delta", "partial_json": args})...)
+			if block.Kind == "thinking" {
+				if signature, _ := item["encrypted_content"].(string); signature != "" {
+					events = append(events, t.delta(key, map[string]any{"type": "signature_delta", "signature": signature})...)
+				}
 			}
 		}
 		events = append(events, t.closeBlock(key)...)

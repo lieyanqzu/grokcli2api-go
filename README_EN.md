@@ -74,6 +74,12 @@ Before forwarding `POST /v1/chat/completions`, the service rebuilds the body usi
 
 Malformed content or broken message/tool-call relationships return an OpenAI-shaped local `422 invalid_request_error`. The `grok-4.5*` and `composer` model families also drop unsupported sampling penalties and stop parameters.
 
+### Responses format selection
+
+`POST /v1/responses` uses the OpenAI Responses API format by default. Request fields are sanitized against the Grok CLI 0.2.99 Responses types, while Grok-native extensions are removed from non-streaming responses and SSE events. Native passthrough is enabled only for an explicit Grok CLI identity: `X-XAI-Token-Auth: xai-grok-cli`, `x-grok-client-version`, a recognized Grok client name/identifier, or a `grok-cli/`, `grok-shell/`, or `grok-pager/` User-Agent. Arbitrary or unknown `x-grok-client-*` values do not select the native format.
+
+`POST /v1/messages` remains Anthropic-shaped externally and executes through the upstream Responses API. Anthropic `metadata.user_id` maps to the Responses `safety_identifier`; `stop_sequences`, which the Responses request cannot represent, is not forwarded and produces a compatibility warning.
+
 ## Quick Start
 
 ### One-command deployment (Linux)

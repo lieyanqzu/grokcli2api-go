@@ -74,6 +74,12 @@ flowchart LR
 
 格式错误或会破坏消息、工具调用关系的内容会在本地返回 OpenAI 格式的 `422 invalid_request_error`。`grok-4.5*` 与 `composer` 模型族还会移除其不支持的采样惩罚和停止参数。
 
+### Responses 格式分流
+
+`POST /v1/responses` 默认按 OpenAI Responses API 处理：请求字段会按 Grok CLI 0.2.99 的 Responses 类型清洗，非流式响应与 SSE 事件会移除 Grok 原生扩展。只有请求包含明确的 Grok CLI 标识时才启用原生透传，包括 `X-XAI-Token-Auth: xai-grok-cli`、`x-grok-client-version`、已知的 Grok 客户端名称/标识，或 `grok-cli/`、`grok-shell/`、`grok-pager/` 等 User-Agent。任意或未知的 `x-grok-client-*` 值不会触发原生格式。
+
+`POST /v1/messages` 仍以 Anthropic 格式对外，并通过上游 Responses API 执行。Anthropic `metadata.user_id` 会映射为 Responses 的 `safety_identifier`；无法由 Responses 表达的 `stop_sequences` 不会转发，并会记录兼容性警告。
+
 ## 快速开始
 
 ### 一键部署（Linux）

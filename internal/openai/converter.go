@@ -2,6 +2,7 @@ package openai
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -42,10 +43,39 @@ func ValidateResponsesRequest(body map[string]any, native bool) error {
 	}
 	switch input.(type) {
 	case string, []any:
-		return nil
 	default:
 		return fmt.Errorf("input is required and must be a string or array")
 	}
+	for _, key := range []string{"stream", "store", "parallel_tool_calls", "background"} {
+		if value, exists := body[key]; exists {
+			if _, ok := value.(bool); !ok {
+				return fmt.Errorf("%s must be a boolean", key)
+			}
+		}
+	}
+	for _, key := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens", "max_tool_calls"} {
+		if value, exists := body[key]; exists {
+			number, ok := chatNumber(value)
+			if !ok || !finiteNumber(number) || number <= 0 || math.Trunc(number) != number {
+				return fmt.Errorf("%s must be a positive integer", key)
+			}
+		}
+	}
+	for key, bounds := range map[string][2]float64{"temperature": {0, 2}, "top_p": {0, 1}} {
+		if value, exists := body[key]; exists {
+			number, ok := chatNumber(value)
+			if !ok || !finiteNumber(number) || number < bounds[0] || number > bounds[1] {
+				return fmt.Errorf("%s must be a number between %s and %s", key, formatNumber(bounds[0]), formatNumber(bounds[1]))
+			}
+		}
+	}
+	if value, exists := body["top_logprobs"]; exists {
+		number, ok := chatNumber(value)
+		if !ok || !finiteNumber(number) || number < 0 || number > 20 || math.Trunc(number) != number {
+			return fmt.Errorf("top_logprobs must be an integer between 0 and 20")
+		}
+	}
+	return nil
 }
 
 func validateModel(body map[string]any) error {
@@ -71,17 +101,6 @@ func PrepareResponses(body map[string]any) map[string]any {
 	out := clone(body)
 	out["model"] = UpstreamModel(String(body, "model", ""))
 	out["stream"] = IsStreaming(body)
-	if IsStrictCompatibilityModel(String(body, "model", "")) {
-		// Codex clients may send this extension, but these models do not
-		// expose the corresponding Responses API argument.
-		delete(out, "external_web_access")
-		delete(out, "externalWebAccess")
-		delete(out, "presence_penalty")
-		delete(out, "presencePenalty")
-		delete(out, "frequency_penalty")
-		delete(out, "frequencyPenalty")
-		delete(out, "stop")
-	}
 	normalizeReasoning(out, true)
 	if _, ok := out["input"]; !ok {
 		if messages, legacy := out["messages"]; legacy {
@@ -107,6 +126,34 @@ func PrepareResponses(body map[string]any) map[string]any {
 	}
 	if _, ok := out["store"]; !ok {
 		out["store"] = false
+	}
+	if _, ok := out["safety_identifier"]; !ok {
+		if user, exists := out["user"]; exists {
+			out["safety_identifier"] = user
+		}
+	}
+	return filterResponsesRequest(out)
+}
+
+// filterResponsesRequest keeps the OpenAI Responses fields implemented by the
+// Grok CLI 0.2.99 upstream. Native Grok CLI requests bypass this function via
+// PrepareNativeResponses and retain their extension fields unchanged.
+func filterResponsesRequest(body map[string]any) map[string]any {
+	allowed := map[string]bool{
+		"background": true, "conversation": true, "include": true, "input": true,
+		"instructions": true, "max_output_tokens": true, "max_tool_calls": true,
+		"metadata": true, "model": true, "parallel_tool_calls": true,
+		"previous_response_id": true, "prompt": true, "prompt_cache_key": true,
+		"prompt_cache_retention": true, "reasoning": true, "safety_identifier": true,
+		"service_tier": true, "store": true, "stream": true, "stream_options": true,
+		"temperature": true, "text": true, "tool_choice": true, "tools": true,
+		"top_logprobs": true, "top_p": true, "truncation": true,
+	}
+	out := make(map[string]any, len(allowed))
+	for key, value := range body {
+		if allowed[key] {
+			out[key] = value
+		}
 	}
 	return out
 }
@@ -239,6 +286,28 @@ func NormalizeResponse(raw map[string]any, fallbackModel string) map[string]any 
 	}
 	if _, ok := out["output"]; !ok {
 		out["output"] = []any{}
+	}
+	return filterResponseObject(out)
+}
+
+func filterResponseObject(body map[string]any) map[string]any {
+	allowed := map[string]bool{
+		"id": true, "object": true, "created_at": true, "status": true,
+		"background": true, "billing": true, "completed_at": true, "conversation": true,
+		"error": true, "incomplete_details": true, "instructions": true,
+		"max_output_tokens": true, "max_tool_calls": true, "metadata": true, "model": true,
+		"output": true, "parallel_tool_calls": true, "previous_response_id": true,
+		"prompt": true, "prompt_cache_key": true, "prompt_cache_retention": true,
+		"reasoning": true, "safety_identifier": true, "service_tier": true,
+		"store": true, "temperature": true, "text": true, "tool_choice": true,
+		"tools": true, "top_logprobs": true, "top_p": true, "truncation": true,
+		"usage": true,
+	}
+	out := make(map[string]any, len(body))
+	for key, value := range body {
+		if allowed[key] {
+			out[key] = value
+		}
 	}
 	return out
 }

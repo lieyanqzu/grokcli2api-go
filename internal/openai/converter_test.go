@@ -1,6 +1,9 @@
 package openai
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestPrepareChatPreservesExtensions(t *testing.T) {
 	body := map[string]any{"model": "grok-4", "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "reasoning_effort": "low"}
@@ -81,7 +84,7 @@ func TestPrepareResponsesPreservesModel(t *testing.T) {
 	}
 }
 
-func TestPrepareResponsesStripsUnsupportedGrok45ExternalWebAccess(t *testing.T) {
+func TestPrepareResponsesStripsFieldsOutsideUpstreamSchema(t *testing.T) {
 	body := map[string]any{
 		"model": "grok-4.5", "input": "hello",
 		"external_web_access": true, "externalWebAccess": true,
@@ -97,9 +100,14 @@ func TestPrepareResponsesStripsUnsupportedGrok45ExternalWebAccess(t *testing.T) 
 		t.Fatal("PrepareResponses mutated the caller's request")
 	}
 
-	other := PrepareResponses(map[string]any{"model": "grok-4", "input": "hello", "external_web_access": true})
-	if other["external_web_access"] != true {
-		t.Fatal("external_web_access should remain available to other models")
+	other := PrepareResponses(map[string]any{
+		"model": "grok-4", "input": "hello", "external_web_access": true,
+		"presence_penalty": float64(0.5), "stop": []any{"done"}, "unknown": true,
+	})
+	for _, key := range []string{"external_web_access", "presence_penalty", "stop", "unknown"} {
+		if _, ok := other[key]; ok {
+			t.Fatalf("%s should not be forwarded: %#v", key, other)
+		}
 	}
 }
 
@@ -157,13 +165,55 @@ func TestPrepareResponsesUsesNativeInputAndLegacyAliases(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesMapsUserToSafetyIdentifier(t *testing.T) {
+	out := PrepareResponses(map[string]any{
+		"model": "grok-4", "input": "hello", "user": "user-1",
+	})
+	if out["safety_identifier"] != "user-1" {
+		t.Fatalf("safety_identifier = %#v", out["safety_identifier"])
+	}
+	if _, ok := out["user"]; ok {
+		t.Fatalf("legacy user leaked upstream: %#v", out)
+	}
+}
+
+func TestValidateResponsesRequestRejectsInvalidUpstreamOptions(t *testing.T) {
+	tests := []struct {
+		field string
+		value any
+	}{
+		{field: "stream", value: "true"},
+		{field: "max_output_tokens", value: float64(1.5)},
+		{field: "max_tool_calls", value: float64(0)},
+		{field: "temperature", value: float64(3)},
+		{field: "top_p", value: float64(-1)},
+		{field: "top_logprobs", value: float64(21)},
+	}
+	for _, test := range tests {
+		t.Run(test.field, func(t *testing.T) {
+			body := map[string]any{"model": "grok-4", "input": "hello", test.field: test.value}
+			if err := ValidateResponsesRequest(body, false); err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+	if err := ValidateResponsesRequest(map[string]any{
+		"model": "grok-build", "input": "hello", "stream": "native-extension",
+	}, true); err != nil {
+		t.Fatalf("native request was over-validated: %v", err)
+	}
+}
+
 func TestNormalizeResponseDoesNotCreateChatEnvelope(t *testing.T) {
-	out := NormalizeResponse(map[string]any{"output": []any{map[string]any{"type": "message"}}}, "grok-4")
+	out := NormalizeResponse(map[string]any{"output": []any{map[string]any{"type": "message"}}, "grok_extension": true}, "grok-4")
 	if out["object"] != "response" || out["model"] != "grok-4" {
 		t.Fatalf("unexpected response: %#v", out)
 	}
 	if _, exists := out["choices"]; exists {
 		t.Fatal("Responses object must not contain synthesized choices")
+	}
+	if _, exists := out["grok_extension"]; exists {
+		t.Fatal("Grok-native response field leaked into the default OpenAI response")
 	}
 }
 

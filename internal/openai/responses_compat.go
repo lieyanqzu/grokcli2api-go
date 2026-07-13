@@ -347,10 +347,12 @@ func (c *ResponsesCompatibility) normalizeToolSources(sources []toolSource) ([]a
 			add(normalizeWebSearchTool(tool))
 			return nil
 		case "image_generation":
-			// Grok CLI has no equivalent image generation tool. Codex treats
-			// it as optional, so omit it and continue with the remaining tools.
+			// Grok CLI 0.2.99 exposes the OpenAI image_generation tool and its
+			// streaming events directly.
+			add(clone(tool))
 			return nil
-		case "x_search", "collections_search", "file_search", "code_execution", "code_interpreter", "mcp", "shell":
+		case "file_search", "code_interpreter", "mcp", "shell", "local_shell", "apply_patch",
+			"computer_use_preview", "web_search_2025_08_26", "web_search_preview", "web_search_preview_2025_03_11":
 			add(clone(tool))
 			return nil
 		default:
@@ -401,34 +403,13 @@ func describeDeferred(namespace, name, description string) string {
 }
 
 func normalizeWebSearchTool(tool map[string]any) map[string]any {
-	out := clone(tool)
-	delete(out, "external_web_access")
-	delete(out, "indexed_web_access")
-	delete(out, "search_content_types")
-	delete(out, "search_context_size")
-
-	if filters, ok := tool["filters"].(map[string]any); ok {
-		for _, key := range []string{"allowed_domains", "blocked_domains"} {
-			if domains, exists := filters[key]; exists {
-				out[key] = limitDomains(domains, 5)
-			}
-		}
-		delete(out, "filters")
-	}
-	for _, key := range []string{"allowed_domains", "blocked_domains"} {
-		if domains, exists := out[key]; exists {
-			out[key] = limitDomains(domains, 5)
+	out := map[string]any{"type": "web_search"}
+	for _, key := range []string{"user_location", "search_context_size"} {
+		if value, exists := tool[key]; exists {
+			out[key] = value
 		}
 	}
 	return out
-}
-
-func limitDomains(value any, limit int) any {
-	domains, ok := value.([]any)
-	if !ok || len(domains) <= limit {
-		return value
-	}
-	return append([]any(nil), domains[:limit]...)
 }
 
 func (c *ResponsesCompatibility) alias(identity toolIdentity) string {
@@ -467,10 +448,6 @@ func shortHash(value string) string {
 func (c *ResponsesCompatibility) normalizeToolChoice(body map[string]any) {
 	choice, ok := body["tool_choice"].(map[string]any)
 	if !ok {
-		return
-	}
-	if String(choice, "type", "") == "image_generation" {
-		body["tool_choice"] = "auto"
 		return
 	}
 	name := String(choice, "name", "")
@@ -623,11 +600,22 @@ func (c *ResponsesCompatibility) TranslateStream(event string, data []byte) ([]S
 	if c == nil {
 		return []StreamEvent{{Event: event, Data: data}}, nil
 	}
+	if event != "" && event != "error" && !strings.HasPrefix(event, "response.") {
+		return nil, nil
+	}
 	var payload map[string]any
 	if err := json.Unmarshal(data, &payload); err != nil {
+		if event == "" {
+			return nil, nil
+		}
 		return []StreamEvent{{Event: event, Data: data}}, nil
 	}
 	kind := String(payload, "type", event)
+	if kind != "error" && !strings.HasPrefix(kind, "response.") {
+		// Grok-native stream events are intentionally exposed only to clients
+		// selected by the server's native Grok CLI branch.
+		return nil, nil
+	}
 	switch kind {
 	case "response.output_item.added":
 		if item, ok := payload["item"].(map[string]any); ok && String(item, "type", "") == "function_call" {
@@ -676,6 +664,9 @@ func (c *ResponsesCompatibility) TranslateStream(event string, data []byte) ([]S
 		payload = c.rewriteValue(payload).(map[string]any)
 	default:
 		payload = c.rewriteValue(payload).(map[string]any)
+	}
+	if response, ok := payload["response"].(map[string]any); ok {
+		payload["response"] = filterResponseObject(response)
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {

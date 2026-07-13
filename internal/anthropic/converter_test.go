@@ -3,6 +3,8 @@ package anthropic
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/Futureppo/grokcli2api-go/internal/grok"
@@ -111,9 +113,9 @@ func TestPreparePreservesAnthropicWebSearchTool(t *testing.T) {
 	}
 }
 
-func TestPrepareStrictComposerDropsStopAndCapsDomains(t *testing.T) {
+func TestPrepareDropsUnsupportedStopAndCapsDomains(t *testing.T) {
 	prepared, err := Prepare(map[string]any{
-		"model": "grok-composer-2.5-fast", "max_tokens": float64(128),
+		"model": "grok-4", "max_tokens": float64(128),
 		"messages":       []any{map[string]any{"role": "user", "content": "search"}},
 		"stop_sequences": []any{"done"},
 		"tools": []any{map[string]any{
@@ -127,9 +129,53 @@ func TestPrepareStrictComposerDropsStopAndCapsDomains(t *testing.T) {
 	if _, ok := prepared.Body["stop"]; ok {
 		t.Fatalf("stop leaked upstream: %#v", prepared.Body)
 	}
+	if !slices.Contains(prepared.Warnings, "stop_sequences") {
+		t.Fatalf("warnings = %#v", prepared.Warnings)
+	}
 	tool := prepared.Body["tools"].([]any)[0].(map[string]any)
 	if domains := tool["allowed_domains"].([]any); len(domains) != 5 {
 		t.Fatalf("allowed_domains = %#v", domains)
+	}
+}
+
+func TestPrepareMapsAnthropicUserIDToResponsesSafetyIdentifier(t *testing.T) {
+	prepared, err := Prepare(map[string]any{
+		"model": "grok-4", "max_tokens": float64(128),
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+		"metadata": map[string]any{"user_id": "user-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.Body["safety_identifier"] != "user-1" || prepared.Body["user"] != nil {
+		t.Fatalf("body = %#v", prepared.Body)
+	}
+}
+
+func TestValidateRejectsInvalidSamplingOptions(t *testing.T) {
+	base := func() map[string]any {
+		return map[string]any{
+			"model": "grok-4", "max_tokens": float64(128),
+			"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+		}
+	}
+	tests := []struct {
+		field string
+		value any
+	}{
+		{field: "max_tokens", value: float64(1.5)},
+		{field: "stream", value: "true"},
+		{field: "temperature", value: float64(2)},
+		{field: "top_p", value: float64(-1)},
+	}
+	for _, test := range tests {
+		t.Run(test.field, func(t *testing.T) {
+			body := base()
+			body[test.field] = test.value
+			if err := Validate(body); err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("error = %v", err)
+			}
+		})
 	}
 }
 
@@ -207,6 +253,38 @@ func TestStreamTranslatorProducesAnthropicSequence(t *testing.T) {
 		if names[i] != want[i] {
 			t.Fatalf("events=%v", names)
 		}
+	}
+}
+
+func TestStreamTranslatorEmitsThinkingSignature(t *testing.T) {
+	translator := NewStreamTranslator("grok-4")
+	inputs := []grok.SSEEvent{
+		jsonEvent("response.output_item.added", map[string]any{
+			"type": "response.output_item.added", "output_index": float64(0),
+			"item": map[string]any{"id": "reasoning-1", "type": "reasoning", "summary": []any{}},
+		}),
+		jsonEvent("response.reasoning_summary_text.delta", map[string]any{
+			"type": "response.reasoning_summary_text.delta", "item_id": "reasoning-1", "delta": "thought",
+		}),
+		jsonEvent("response.output_item.done", map[string]any{
+			"type": "response.output_item.done", "output_index": float64(0),
+			"item": map[string]any{"id": "reasoning-1", "type": "reasoning", "encrypted_content": "signature-1"},
+		}),
+	}
+	var deltas []map[string]any
+	for _, input := range inputs {
+		events, err := translator.Handle(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			if event.Name == "content_block_delta" {
+				deltas = append(deltas, event.Data["delta"].(map[string]any))
+			}
+		}
+	}
+	if len(deltas) != 2 || deltas[0]["type"] != "thinking_delta" || deltas[1]["type"] != "signature_delta" || deltas[1]["signature"] != "signature-1" {
+		t.Fatalf("deltas = %#v", deltas)
 	}
 }
 

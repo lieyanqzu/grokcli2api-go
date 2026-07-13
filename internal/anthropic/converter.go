@@ -3,6 +3,7 @@ package anthropic
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -23,8 +24,8 @@ func Validate(body map[string]any) error {
 		return fmt.Errorf("model is required and must be a string")
 	}
 	max, ok := number(body["max_tokens"])
-	if !ok || max <= 0 {
-		return fmt.Errorf("max_tokens is required and must be greater than zero")
+	if !ok || math.IsNaN(max) || math.IsInf(max, 0) || max <= 0 || math.Trunc(max) != max {
+		return fmt.Errorf("max_tokens is required and must be a positive integer")
 	}
 	messages, ok := body["messages"].([]any)
 	if !ok || len(messages) == 0 {
@@ -32,6 +33,19 @@ func Validate(body map[string]any) error {
 	}
 	if _, exists := body["top_k"]; exists {
 		return fmt.Errorf("top_k cannot be represented by the Grok Responses API")
+	}
+	if value, exists := body["stream"]; exists {
+		if _, ok := value.(bool); !ok {
+			return fmt.Errorf("stream must be a boolean")
+		}
+	}
+	for _, key := range []string{"temperature", "top_p"} {
+		if value, exists := body[key]; exists {
+			number, ok := number(value)
+			if !ok || math.IsNaN(number) || math.IsInf(number, 0) || number < 0 || number > 1 {
+				return fmt.Errorf("%s must be a number between 0 and 1", key)
+			}
+		}
 	}
 	return nil
 }
@@ -63,9 +77,6 @@ func Prepare(body map[string]any) (Prepared, error) {
 			out[key] = value
 		}
 	}
-	if stops, ok := body["stop_sequences"]; ok && !openai.IsStrictCompatibilityModel(stringValue(body["model"])) {
-		out["stop"] = stops
-	}
 	if tools, ok := body["tools"].([]any); ok {
 		converted, err := convertTools(tools)
 		if err != nil {
@@ -82,7 +93,7 @@ func Prepare(body map[string]any) (Prepared, error) {
 	}
 	if metadata, ok := body["metadata"].(map[string]any); ok {
 		if userID, ok := metadata["user_id"].(string); ok && userID != "" {
-			out["user"] = userID
+			out["safety_identifier"] = userID
 		}
 	}
 	if thinking, ok := body["thinking"].(map[string]any); ok && stringValue(thinking["type"]) == "enabled" {
@@ -115,6 +126,9 @@ func Prepare(body map[string]any) (Prepared, error) {
 		return Prepared{}, err
 	}
 	warnings := []string{}
+	if _, ok := body["stop_sequences"]; ok {
+		warnings = append(warnings, "stop_sequences")
+	}
 	for _, key := range []string{"service_tier", "context_management", "container"} {
 		if _, ok := body[key]; ok {
 			warnings = append(warnings, key)
@@ -457,7 +471,8 @@ func responseContent(raw map[string]any) []any {
 				}
 			case "function_call", "custom_tool_call":
 				content = append(content, toolUseBlock(item))
-			case "web_search_call", "file_search_call", "code_interpreter_call", "computer_call", "mcp_call":
+			case "web_search_call", "file_search_call", "code_interpreter_call", "computer_call", "mcp_call",
+				"image_generation_call", "local_shell_call", "shell_call", "apply_patch_call", "mcp_list_tools":
 				content = append(content, map[string]any{"type": "server_tool_use", "id": itemID(item), "name": item["type"], "input": item["action"]})
 			}
 		}

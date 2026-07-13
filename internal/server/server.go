@@ -318,7 +318,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prepareStarted := time.Now()
-	native := isGrokBuildClient(r)
+	native := isGrokCLIClient(r)
 	if err := openai.ValidateResponsesRequest(body, native); err != nil {
 		timing.MarkPrepare(time.Since(prepareStarted))
 		writeError(w, http.StatusUnprocessableEntity, err.Error(), "invalid_request_error", "422")
@@ -902,14 +902,22 @@ func anthropicErrorType(status int) string {
 		return "api_error"
 	}
 }
-func isGrokBuildClient(r *http.Request) bool {
-	for _, name := range []string{"x-grok-client-name", "x-grok-client-identifier", "x-grok-client-surface", "x-grok-client-version"} {
-		if strings.TrimSpace(r.Header.Get(name)) != "" {
+func isGrokCLIClient(r *http.Request) bool {
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("X-XAI-Token-Auth")), "xai-grok-cli") {
+		return true
+	}
+	if strings.TrimSpace(r.Header.Get("x-grok-client-version")) != "" {
+		return true
+	}
+	for _, name := range []string{"x-grok-client-name", "x-grok-client-identifier"} {
+		value := strings.ToLower(strings.TrimSpace(r.Header.Get(name)))
+		switch value {
+		case "grok-build", "grok-cli", "grok-shell", "grok-pager", "xai-grok-cli":
 			return true
 		}
 	}
 	ua := strings.ToLower(r.UserAgent())
-	for _, marker := range []string{"grok-build", "grok-shell/", "grok-pager/", "xai-grok-cli/"} {
+	for _, marker := range []string{"grok-build", "grok-cli/", "grok-shell/", "grok-pager/", "xai-grok-cli/"} {
 		if strings.Contains(ua, marker) {
 			return true
 		}
