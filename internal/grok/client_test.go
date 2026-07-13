@@ -61,6 +61,8 @@ func TestPermanentAccountDenialDetection(t *testing.T) {
 		{name: "top-level error", status: http.StatusForbidden, body: `{"error":"Access to the chat endpoint is denied. Please update permissions."}`, want: true},
 		{name: "nested error", status: http.StatusForbidden, body: `{"error":{"code":"permission_denied","message":"ACCESS TO THE CHAT ENDPOINT IS DENIED"}}`, want: true},
 		{name: "raw text", status: http.StatusForbidden, body: `Access to the chat endpoint is denied.`, want: true},
+		{name: "generic account denial", status: http.StatusForbidden, body: `{"error":"Access denied."}`, want: true},
+		{name: "generic raw denial", status: http.StatusForbidden, body: `Access denied.`, want: true},
 		{name: "other forbidden", status: http.StatusForbidden, body: `{"error":"model access denied"}`},
 		{name: "quota forbidden", status: http.StatusForbidden, body: `{"code":"personal-team-blocked:spending-limit","error":"quota exhausted"}`},
 		{name: "unauthorized with matching text", status: http.StatusUnauthorized, body: `{"error":"Access to the chat endpoint is denied"}`},

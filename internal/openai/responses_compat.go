@@ -403,13 +403,10 @@ func describeDeferred(namespace, name, description string) string {
 }
 
 func normalizeWebSearchTool(tool map[string]any) map[string]any {
-	out := map[string]any{"type": "web_search"}
-	for _, key := range []string{"user_location", "search_context_size"} {
-		if value, exists := tool[key]; exists {
-			out[key] = value
-		}
-	}
-	return out
+	// The 0.2.99 client types expose optional search fields, but the CLI proxy
+	// currently rejects them with "Argument not supported". Send the minimal
+	// hosted-tool discriminator until the upstream accepts those arguments.
+	return map[string]any{"type": "web_search"}
 }
 
 func (c *ResponsesCompatibility) alias(identity toolIdentity) string {
@@ -448,6 +445,14 @@ func shortHash(value string) string {
 func (c *ResponsesCompatibility) normalizeToolChoice(body map[string]any) {
 	choice, ok := body["tool_choice"].(map[string]any)
 	if !ok {
+		return
+	}
+	switch String(choice, "type", "") {
+	case "web_search", "web_search_2025_08_26", "web_search_preview", "web_search_preview_2025_03_11",
+		"image_generation", "file_search", "code_interpreter", "computer_use_preview", "mcp", "shell", "local_shell", "apply_patch":
+		// The CLI proxy's ModelToolChoice accepts required/auto/none and
+		// function choices, but rejects hosted-tool choice objects.
+		body["tool_choice"] = "required"
 		return
 	}
 	name := String(choice, "name", "")

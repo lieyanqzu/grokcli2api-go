@@ -32,6 +32,8 @@ const quotaErrorCode = "personal-team-blocked:spending-limit"
 
 const permanentChatDenialMessage = "access to the chat endpoint is denied"
 
+const genericAccessDenialMessage = "access denied"
+
 const permanentChatDenialReason = "chat_endpoint_denied"
 
 const freeModelQuotaMessage = "used all the included free usage for model"
@@ -714,7 +716,16 @@ func isPermanentAccountDenial(err *APIError) bool {
 		return false
 	}
 	text := strings.ToLower(strings.Join([]string{err.UpstreamCode, err.UpstreamMessage, err.Body}, " "))
-	return strings.Contains(text, permanentChatDenialMessage)
+	if strings.Contains(text, permanentChatDenialMessage) {
+		return true
+	}
+	for _, candidate := range []string{err.UpstreamCode, err.UpstreamMessage, err.Body} {
+		normalized := strings.Trim(strings.ToLower(strings.TrimSpace(candidate)), " .!\t\r\n")
+		if normalized == genericAccessDenialMessage {
+			return true
+		}
+	}
+	return false
 }
 
 func isFreeModelQuotaExhausted(err *APIError) bool {

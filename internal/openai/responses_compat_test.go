@@ -153,15 +153,14 @@ func TestPrepareCompatibleResponsesNormalizesCodexHostedTools(t *testing.T) {
 			t.Fatalf("%s leaked upstream: %#v", key, web)
 		}
 	}
-	if web["search_context_size"] != "high" || web["user_location"] == nil {
-		t.Fatalf("web search fields = %#v", web)
+	if len(web) != 1 || web["type"] != "web_search" {
+		t.Fatalf("web search tool = %#v", web)
 	}
 	image := tools[1].(map[string]any)
 	if image["type"] != "image_generation" || image["quality"] != "auto" {
 		t.Fatalf("image tool = %#v", image)
 	}
-	choice, ok := wire["tool_choice"].(map[string]any)
-	if !ok || choice["type"] != "image_generation" {
+	if wire["tool_choice"] != "required" {
 		t.Fatalf("tool_choice = %#v", wire["tool_choice"])
 	}
 }
