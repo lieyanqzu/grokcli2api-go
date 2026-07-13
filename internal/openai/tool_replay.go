@@ -133,6 +133,9 @@ func normalizeReplayItems(items []map[string]any) []map[string]any {
 			if id := strings.TrimSpace(String(item, "id", "")); id != "" {
 				normalized["id"] = id
 			}
+			if namespace := strings.TrimSpace(String(item, "namespace", "")); namespace != "" {
+				normalized["namespace"] = namespace
+			}
 			out = append(out, normalized)
 		case "custom_tool_call":
 			callID := strings.TrimSpace(String(item, "call_id", ""))
@@ -152,6 +155,9 @@ func normalizeReplayItems(items []map[string]any) []map[string]any {
 			}
 			if status := strings.TrimSpace(String(item, "status", "")); status != "" {
 				normalized["status"] = status
+			}
+			if namespace := strings.TrimSpace(String(item, "namespace", "")); namespace != "" {
+				normalized["namespace"] = namespace
 			}
 			out = append(out, normalized)
 		}
@@ -267,34 +273,38 @@ func expandItemReferences(cache *ToolReplayCache, model string, input []any) []a
 	if cache == nil || len(input) == 0 {
 		return input
 	}
-	out := make([]any, 0, len(input))
-	changed := false
-	for _, raw := range input {
+	var out []any
+	for index, raw := range input {
 		item, ok := raw.(map[string]any)
-		if !ok {
-			out = append(out, raw)
-			continue
-		}
-		if String(item, "type", "") != "item_reference" {
-			out = append(out, raw)
+		if !ok || String(item, "type", "") != "item_reference" {
+			if out != nil {
+				out = append(out, raw)
+			}
 			continue
 		}
 		id := strings.TrimSpace(String(item, "id", ""))
 		if id == "" {
-			out = append(out, raw)
+			if out != nil {
+				out = append(out, raw)
+			}
 			continue
 		}
 		cached := cache.Get(model, "item:"+id)
 		if len(cached) == 0 {
-			out = append(out, raw)
+			if out != nil {
+				out = append(out, raw)
+			}
 			continue
+		}
+		if out == nil {
+			out = make([]any, 0, len(input)+len(cached)-1)
+			out = append(out, input[:index]...)
 		}
 		for _, c := range cached {
 			out = append(out, c)
 		}
-		changed = true
 	}
-	if !changed {
+	if out == nil {
 		return input
 	}
 	return out
@@ -433,24 +443,32 @@ func pruneOrphanToolOutputs(body map[string]any) {
 			}
 		}
 	}
-	out := make([]any, 0, len(input))
-	for _, raw := range input {
+	var out []any
+	for index, raw := range input {
 		item, ok := raw.(map[string]any)
 		if !ok {
-			out = append(out, raw)
+			if out != nil {
+				out = append(out, raw)
+			}
 			continue
 		}
 		switch String(item, "type", "") {
 		case "function_call_output", "custom_tool_call_output":
 			callID := strings.TrimSpace(String(item, "call_id", ""))
-			if callID == "" {
-				continue
-			}
-			if _, ok := calls[callID]; !ok {
+			_, matched := calls[callID]
+			if callID == "" || !matched {
+				if out == nil {
+					out = make([]any, 0, len(input))
+					out = append(out, input[:index]...)
+				}
 				continue
 			}
 		}
-		out = append(out, raw)
+		if out != nil {
+			out = append(out, raw)
+		}
 	}
-	body["input"] = out
+	if out != nil {
+		body["input"] = out
+	}
 }

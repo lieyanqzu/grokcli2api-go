@@ -63,6 +63,7 @@ func TestToolReplayExpandsItemReference(t *testing.T) {
 	wire, _, err := PrepareCompatibleResponsesWithCache(map[string]any{
 		"model": "grok-4.5",
 		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "continue"},
 			map[string]any{"type": "item_reference", "id": "fc_item"},
 			map[string]any{"type": "function_call_output", "call_id": "call_ref", "output": "ok"},
 		},
@@ -71,11 +72,74 @@ func TestToolReplayExpandsItemReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	input := wire["input"].([]any)
-	if len(input) != 2 {
+	if len(input) != 3 {
 		t.Fatalf("input = %#v", input)
 	}
-	if String(input[0].(map[string]any), "type", "") != "function_call" {
-		t.Fatalf("expanded item = %#v", input[0])
+	if String(input[1].(map[string]any), "type", "") != "function_call" {
+		t.Fatalf("expanded item = %#v", input[1])
+	}
+}
+
+func TestToolReplayPreservesNamespacedFunctionAlias(t *testing.T) {
+	cache := NewToolReplayCache(0, 0)
+	RememberCompletedResponse(cache, "grok-4.5", map[string]any{
+		"id": "resp_ns",
+		"output": []any{map[string]any{
+			"id": "fc_ns", "type": "function_call", "call_id": "call_ns",
+			"name": "fetch", "namespace": "mcp__github__", "arguments": `{}`,
+		}},
+	}, "")
+	tools := []any{map[string]any{
+		"type": "namespace", "name": "mcp__github__",
+		"tools": []any{map[string]any{"type": "function", "name": "fetch", "parameters": objectSchema()}},
+	}}
+	tests := map[string]map[string]any{
+		"previous_response_id": {
+			"model": "grok-4.5", "previous_response_id": "resp_ns", "tools": tools,
+			"input": []any{map[string]any{"type": "function_call_output", "call_id": "call_ns", "output": "ok"}},
+		},
+		"item_reference": {
+			"model": "grok-4.5", "tools": tools,
+			"input": []any{
+				map[string]any{"type": "item_reference", "id": "fc_ns"},
+				map[string]any{"type": "function_call_output", "call_id": "call_ns", "output": "ok"},
+			},
+		},
+	}
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			wire, _, err := PrepareCompatibleResponsesWithCache(body, cache)
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := wire["input"].([]any)
+			call := input[0].(map[string]any)
+			if got := String(call, "name", ""); got != "mcp__github__fetch" {
+				t.Fatalf("replayed call name = %q, want namespaced tool alias; call = %#v", got, call)
+			}
+			if _, ok := toolsByName(t, wire["tools"])["mcp__github__fetch"]; !ok {
+				t.Fatalf("namespaced tool missing from wire tools: %#v", wire["tools"])
+			}
+		})
+	}
+}
+
+func TestNormalizeReplayItemsPreservesNamespace(t *testing.T) {
+	tests := []map[string]any{
+		{
+			"type": "function_call", "call_id": "call_fn", "name": "fetch",
+			"namespace": "mcp__github__", "arguments": `{}`,
+		},
+		{
+			"type": "custom_tool_call", "call_id": "call_custom", "name": "exec",
+			"namespace": "plugin__", "input": "echo ok",
+		},
+	}
+	for _, item := range tests {
+		got := normalizeReplayItems([]map[string]any{item})
+		if len(got) != 1 || got[0]["namespace"] != item["namespace"] {
+			t.Fatalf("normalized replay item lost namespace: got %#v, input %#v", got, item)
+		}
 	}
 }
 
@@ -95,6 +159,20 @@ func TestToolReplayPrunesOrphanOutputs(t *testing.T) {
 	input := wire["input"].([]any)
 	if len(input) != 1 || String(input[0].(map[string]any), "type", "") != "message" {
 		t.Fatalf("expected only message after orphan prune, got %#v", input)
+	}
+}
+
+func TestPruneOrphanToolOutputsKeepsSliceWhenUnchanged(t *testing.T) {
+	input := []any{
+		map[string]any{"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": `{}`},
+		map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+		map[string]any{"type": "message", "role": "user", "content": "continue"},
+	}
+	body := map[string]any{"input": input}
+	pruneOrphanToolOutputs(body)
+	got := body["input"].([]any)
+	if &got[0] != &input[0] {
+		t.Fatal("unchanged input was copied")
 	}
 }
 
@@ -248,4 +326,3 @@ func TestPrepareCompatibleResponsesStripsNullReasoningFields(t *testing.T) {
 		t.Fatalf("encrypted_content must be stripped: %#v", reasoning)
 	}
 }
-

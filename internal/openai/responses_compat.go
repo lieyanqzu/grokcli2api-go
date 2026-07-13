@@ -597,7 +597,7 @@ func stringifyToolArguments(value any) string {
 
 // flattenToolOutput collapses array/object tool outputs into a single string
 // accepted by the Grok CLI function_call_output shape.
-func flattenToolOutput(value any) any {
+func flattenToolOutput(value any) string {
 	switch typed := value.(type) {
 	case nil:
 		return ""
