@@ -126,6 +126,29 @@ func TestPrepareCompatibleResponsesDropsUnknownInput(t *testing.T) {
 	}
 }
 
+func TestPrepareCompatibleResponsesRewritesAssistantOutputTextHistory(t *testing.T) {
+	wire, _, err := PrepareCompatibleResponses(map[string]any{
+		"model": "grok-4.5",
+		"input": []any{
+			map[string]any{
+				"type": "message", "role": "assistant", "id": "msg_1", "status": "completed",
+				"content": []any{map[string]any{"type": "output_text", "text": "first response"}},
+			},
+			map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "continue"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := wire["input"].([]any)
+	message := input[0].(map[string]any)
+	content := message["content"].([]any)
+	part := content[0].(map[string]any)
+	if part["type"] != "input_text" || part["text"] != "first response" {
+		t.Fatalf("assistant history content = %#v", content)
+	}
+}
+
 func TestPrepareCompatibleResponsesNormalizesCodexHostedTools(t *testing.T) {
 	wire, _, err := PrepareCompatibleResponses(map[string]any{
 		"model": "grok-4.5", "input": "hello",
