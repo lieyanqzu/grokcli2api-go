@@ -348,6 +348,58 @@ func TestEncryptedResponsesReasoningIsStatefulOnlyOnNativeBackend(t *testing.T) 
 	}
 }
 
+func TestWithoutOpaqueStateReturnsSanitizedImmutablePlan(t *testing.T) {
+	t.Run("responses", func(t *testing.T) {
+		plan := mustPlan(t, ProtocolResponses, map[string]any{
+			"model": "m", "input": []any{
+				map[string]any{"type": "reasoning", "encrypted_content": "lost-state"},
+				map[string]any{"type": "reasoning", "encrypted_content": "owned-state"},
+				map[string]any{"type": "message", "role": "user", "content": "continue"},
+			},
+		})
+		clean := plan.WithoutOpaqueState([]StateHandle{{Kind: StateOpaqueToken, Value: "lost-state"}})
+		if len(plan.StateHandles()) != 2 || len(clean.StateHandles()) != 1 {
+			t.Fatalf("state handles original=%#v clean=%#v", plan.StateHandles(), clean.StateHandles())
+		}
+		original, err := plan.Render(modelcatalog.ModelDescriptor{Backend: modelcatalog.BackendResponses})
+		if err != nil || !contains(outputString(original.Body, false), "lost-state") {
+			t.Fatalf("original plan was mutated: body=%#v err=%v", original, err)
+		}
+		attempt, err := clean.Render(modelcatalog.ModelDescriptor{Backend: modelcatalog.BackendResponses})
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded := outputString(attempt.Body, false)
+		if contains(encoded, "lost-state") || !contains(encoded, "owned-state") || !attempt.PreservesState {
+			t.Fatalf("sanitized attempt=%#v encoded=%s", attempt, encoded)
+		}
+	})
+
+	t.Run("messages", func(t *testing.T) {
+		plan := mustPlan(t, ProtocolMessages, map[string]any{
+			"model": "m", "max_tokens": float64(32), "messages": []any{
+				map[string]any{"role": "assistant", "content": []any{
+					map[string]any{"type": "redacted_thinking", "data": "opaque", "signature": "lost-signature"},
+					map[string]any{"type": "thinking", "thinking": "keep", "signature": "owned-signature"},
+				}},
+				map[string]any{"role": "user", "content": "continue"},
+			},
+		})
+		clean := plan.WithoutOpaqueState([]StateHandle{{Kind: StateOpaqueToken, Value: "lost-signature"}})
+		if len(plan.StateHandles()) != 2 || len(clean.StateHandles()) != 1 {
+			t.Fatalf("state handles original=%#v clean=%#v", plan.StateHandles(), clean.StateHandles())
+		}
+		attempt, err := clean.Render(modelcatalog.ModelDescriptor{Backend: modelcatalog.BackendMessages})
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded := outputString(attempt.Body, false)
+		if contains(encoded, "lost-signature") || !contains(encoded, "owned-signature") || !attempt.PreservesState {
+			t.Fatalf("sanitized attempt=%#v encoded=%s", attempt, encoded)
+		}
+	})
+}
+
 func TestCleaningErrorsOnlyWhenNoMinimumInputRemains(t *testing.T) {
 	plan := mustPlan(t, ProtocolResponses, map[string]any{
 		"model": "m", "input": []any{

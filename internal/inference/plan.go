@@ -151,6 +151,79 @@ func (p *RequestPlan) StateHandles() []StateHandle {
 	return append([]StateHandle(nil), p.stateHandles...)
 }
 
+// WithoutOpaqueState returns an immutable copy of the plan with the selected
+// opaque continuation handles removed. A missing local ownership binding can
+// happen after affinity state is lost during an upgrade or container rebuild;
+// the ciphertext must not be forwarded through a newly selected account, but
+// the remaining public conversation can safely start a fresh upstream session.
+func (p *RequestPlan) WithoutOpaqueState(handles []StateHandle) *RequestPlan {
+	if p == nil || len(handles) == 0 {
+		return p
+	}
+	dropped := make(map[string]struct{}, len(handles))
+	for _, handle := range handles {
+		if handle.Kind != StateOpaqueToken {
+			continue
+		}
+		if value := strings.TrimSpace(handle.Value); value != "" {
+			dropped[value] = struct{}{}
+		}
+	}
+	if len(dropped) == 0 {
+		return p
+	}
+
+	body := cloneMap(p.body)
+	switch p.protocol {
+	case ProtocolResponses:
+		input, _ := body["input"].([]any)
+		clean := make([]any, 0, len(input))
+		for _, rawItem := range input {
+			item, _ := rawItem.(map[string]any)
+			if strings.EqualFold(trimmedString(item["type"]), "reasoning") {
+				if encrypted, ok := item["encrypted_content"].(string); ok {
+					if _, remove := dropped[strings.TrimSpace(encrypted)]; remove {
+						continue
+					}
+				}
+			}
+			clean = append(clean, rawItem)
+		}
+		if input != nil {
+			body["input"] = clean
+		}
+	case ProtocolMessages:
+		messages, _ := body["messages"].([]any)
+		for _, rawMessage := range messages {
+			message, _ := rawMessage.(map[string]any)
+			parts, _ := message["content"].([]any)
+			if parts == nil {
+				continue
+			}
+			clean := make([]any, 0, len(parts))
+			for _, rawPart := range parts {
+				part, _ := rawPart.(map[string]any)
+				kind := trimmedString(part["type"])
+				if strings.EqualFold(kind, "thinking") || strings.EqualFold(kind, "redacted_thinking") {
+					if signature, ok := part["signature"].(string); ok {
+						if _, remove := dropped[strings.TrimSpace(signature)]; remove {
+							continue
+						}
+					}
+				}
+				clean = append(clean, rawPart)
+			}
+			message["content"] = clean
+		}
+	}
+
+	copy := *p
+	copy.body = body
+	copy.stateHandles = requestStateHandles(copy.protocol, body)
+	copy.hasState = len(copy.stateHandles) > 0
+	return &copy
+}
+
 // NewRequestPlan validates only public required structure and fields that are
 // intentionally retained. Unsupported fields and content are left for the
 // account-specific renderer to discard silently.

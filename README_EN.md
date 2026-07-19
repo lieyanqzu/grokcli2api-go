@@ -316,6 +316,8 @@ The service recognizes affinity inputs in this priority order:
 
 `previous_response_id`, an explicit session ID, and state signatures create hard affinity. The `.grokcli2api-affinity.json` file under `GROK_AUTHS_DIR` contains only the tenant-namespaced hashed binding, account, model, backend, upstream session, next turn, and expiry. Soft affinity from cache/user fields and `store:false` tool replay remain in memory only. Every mapping is bounded by the configured TTL and capacity. A local API key does not directly choose an account, but it isolates affinity, Response ownership, state signatures, and replay data between tenants; client IP addresses are not used.
 
+After a container rebuild or affinity-state loss, Responses `reasoning.encrypted_content` or an Anthropic thinking signature may have no binding in the current tenant. The service removes only that unknown opaque state and continues the remaining conversation with a fresh upstream session instead of forwarding ciphertext through a random account. Valid bindings that point to different accounts or sessions are still rejected. An unknown `previous_response_id` continues to return 404.
+
 ## Configuration
 
 The service loads environment variables that are not already set from a `.env` file in the current working directory. See [`.env.example`](.env.example) for the complete template and advanced client-identity options.

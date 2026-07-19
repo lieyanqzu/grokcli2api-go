@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -27,6 +28,7 @@ func (e *continuityRequestError) Error() string { return e.Message }
 type inferenceExecution struct {
 	tenant          string
 	model           string
+	plan            *inference.RequestPlan
 	affinity        auth.Affinity
 	pinned          string
 	expectedBackend modelcatalog.Backend
@@ -50,7 +52,7 @@ type continuityLookup struct {
 
 func (s *Server) prepareInferenceExecution(r *http.Request, body map[string]any, plan *inference.RequestPlan) (inferenceExecution, error) {
 	tenant := tenantFromContext(r.Context())
-	execution := inferenceExecution{tenant: tenant, model: plan.Model(), affinity: requestSoftAffinity(r, body)}
+	execution := inferenceExecution{tenant: tenant, model: plan.Model(), plan: plan, affinity: requestSoftAffinity(r, body)}
 	execution.identity = grok.RequestIdentity{RequestID: grok.NewID(), SessionID: newLogicalSession()}
 	execution.identity.ConversationID = execution.identity.SessionID
 	turn := uint64(0)
@@ -63,10 +65,20 @@ func (s *Server) prepareInferenceExecution(r *http.Request, body map[string]any,
 	}
 
 	state := make([]continuityLookup, 0, len(plan.StateHandles()))
+	unknownOpaque := make([]inference.StateHandle, 0)
 	for _, handle := range plan.StateHandles() {
 		affinity := stateHandleAffinity(tenant, handle)
 		key, binding, found := s.continuity.Lookup(tenant, affinity, plan.Model())
+		if handle.Kind == inference.StateOpaqueToken && !found {
+			unknownOpaque = append(unknownOpaque, handle)
+			continue
+		}
 		state = append(state, continuityLookup{handle: handle, affinity: affinity, key: key, binding: binding, found: found})
+	}
+	if len(unknownOpaque) > 0 {
+		plan = plan.WithoutOpaqueState(unknownOpaque)
+		execution.plan = plan
+		slog.Warn("unknown opaque upstream state dropped", "model", plan.Model(), "protocol", plan.Protocol(), "count", len(unknownOpaque))
 	}
 
 	// An existing explicit session is authoritative. Only state tokens which
@@ -326,6 +338,7 @@ func (s *Server) executeNonStreaming(w http.ResponseWriter, r *http.Request, bod
 		s.writePlanError(w, plan.Protocol(), err)
 		return
 	}
+	plan = execution.plan
 	result, err := s.client.DoInference(r.Context(), plan, grok.InferenceOptions{
 		Affinity: execution.affinity, PinnedAccount: execution.pinned, ExpectedBackend: execution.expectedBackend, Identity: execution.identity,
 	})
@@ -365,6 +378,7 @@ func (s *Server) executeStreaming(w http.ResponseWriter, r *http.Request, body m
 		s.writePlanError(w, plan.Protocol(), err)
 		return
 	}
+	plan = execution.plan
 	stream, err := s.client.OpenInference(r.Context(), plan, grok.InferenceOptions{
 		Affinity: execution.affinity, PinnedAccount: execution.pinned, ExpectedBackend: execution.expectedBackend, Identity: execution.identity,
 	})

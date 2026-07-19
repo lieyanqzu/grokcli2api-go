@@ -316,6 +316,8 @@ X-Grok-Session-ID: conversation-123
 
 `previous_response_id`、显式 session ID 和状态签名属于 hard affinity；`GROK_AUTHS_DIR` 下的 `.grokcli2api-affinity.json` 只保存加入 tenant namespace 后的哈希 binding、账号、模型、backend、上游 session、下一 turn 与过期时间。`prompt_cache_key`、用户字段等 soft affinity 与 `store:false` 工具回放仍只保存在内存中。所有映射都受 TTL 与容量上限控制；本地 API Key 不直接选择账号，但会隔离不同 tenant 的 affinity、Response ownership、状态签名与工具回放。客户端 IP 不参与亲和。
 
+容器重建或 affinity 状态丢失后，请求中的 Responses `reasoning.encrypted_content` 或 Anthropic thinking signature 可能在当前 tenant 中没有 binding。服务会删除这部分未知 opaque state，并以新上游 session 继续其余对话，而不会把密文转发给随机账号；已经存在但互相指向不同账号/session 的有效 binding 仍会被拒绝。未知 `previous_response_id` 继续返回 404。
+
 ## 配置说明
 
 程序会从当前工作目录的 `.env` 文件中加载尚未设置的环境变量。完整模板与高级客户端标识选项见 [`.env.example`](.env.example)。
