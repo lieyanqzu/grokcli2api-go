@@ -243,7 +243,7 @@ func TestQuotaErrorSwitchesAccount(t *testing.T) {
 	}
 }
 
-func TestExactChatDenialDeletesAccountAndRetries(t *testing.T) {
+func TestChatDenialKeywordDeletesAccountAndRetries(t *testing.T) {
 	var mu sync.Mutex
 	var tokens []string
 	deniedToken := ""
@@ -259,7 +259,7 @@ func TestExactChatDenialDeletesAccountAndRetries(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if denied {
 			w.WriteHeader(http.StatusForbidden)
-			_, _ = io.WriteString(w, `{"status_code":403,"error":"Access to the chat endpoint is denied. Please update the permissions."}`)
+			_, _ = io.WriteString(w, `{"status_code":403,"error":"Access to the chat endpoint is denied. Please ensure you're using the correct credentials. If you believe this is a mistake, please log into ***.x.ai and update the permissions, or contact support."}`)
 			return
 		}
 		_, _ = io.WriteString(w, `{"id":"chatcmpl-ok","choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
@@ -285,7 +285,7 @@ func TestExactChatDenialDeletesAccountAndRetries(t *testing.T) {
 	}
 }
 
-func TestExactChatDenialDeletesAccountAndRetriesStream(t *testing.T) {
+func TestChatDenialKeywordDeletesAccountAndRetriesStream(t *testing.T) {
 	var mu sync.Mutex
 	var tokens []string
 	deniedToken := ""
@@ -300,7 +300,7 @@ func TestExactChatDenialDeletesAccountAndRetriesStream(t *testing.T) {
 		mu.Unlock()
 		if denied {
 			w.WriteHeader(http.StatusForbidden)
-			_, _ = io.WriteString(w, `{"error":{"message":"Access to the chat endpoint is denied. Please update the permissions."}}`)
+			_, _ = io.WriteString(w, `{"status_code":403,"error":"Access to the chat endpoint is denied. Please update the permissions."}`)
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -321,7 +321,7 @@ func TestExactChatDenialDeletesAccountAndRetriesStream(t *testing.T) {
 	}
 }
 
-func TestExactChatDenialDeletesOnlyAccount(t *testing.T) {
+func TestChatDenialKeywordDeletesOnlyAccount(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)

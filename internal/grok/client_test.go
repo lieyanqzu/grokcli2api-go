@@ -63,17 +63,19 @@ func TestPermanentAccountDenialDetection(t *testing.T) {
 		body   string
 		want   bool
 	}{
-		{name: "exact top-level error", status: http.StatusForbidden, body: `{"status_code":403,"error":"Access to the chat endpoint is denied. Please update the permissions."}`, want: true},
-		{name: "exact nested error", status: http.StatusForbidden, body: `{"error":{"code":"permission_denied","message":"Access to the chat endpoint is denied. Please update the permissions."}}`, want: true},
-		{name: "missing the", status: http.StatusForbidden, body: `{"error":"Access to the chat endpoint is denied. Please update permissions."}`},
+		{name: "new long error", status: http.StatusForbidden, body: `{"status_code":403,"error":"Access to the chat endpoint is denied. Please ensure you're using the correct credentials. If you believe this is a mistake, please log into ***.x.ai and update the permissions, or contact support."}`, want: true},
+		{name: "old error", status: http.StatusForbidden, body: `{"error":"Access to the chat endpoint is denied. Please update the permissions."}`, want: true},
+		{name: "nested error", status: http.StatusForbidden, body: `{"error":{"code":"permission_denied","message":"Access to the chat endpoint is denied. Please update the permissions."}}`, want: true},
+		{name: "changed suffix", status: http.StatusForbidden, body: `{"error":"Access to the chat endpoint is denied. Please update permissions."}`, want: true},
 		{name: "different case", status: http.StatusForbidden, body: `{"error":"ACCESS TO THE CHAT ENDPOINT IS DENIED. PLEASE UPDATE THE PERMISSIONS."}`},
-		{name: "trailing whitespace", status: http.StatusForbidden, body: `{"error":"Access to the chat endpoint is denied. Please update the permissions. "}`},
-		{name: "short denial", status: http.StatusForbidden, body: `{"error":"Access to the chat endpoint is denied."}`},
+		{name: "trailing whitespace", status: http.StatusForbidden, body: `{"error":"Access to the chat endpoint is denied. Please update the permissions. "}`, want: true},
+		{name: "short denial", status: http.StatusForbidden, body: `{"error":"Access to the chat endpoint is denied."}`, want: true},
+		{name: "raw log error", status: http.StatusForbidden, body: `status_code=403, Access to the chat endpoint is denied. Contact support.`, want: true},
 		{name: "generic account denial", status: http.StatusForbidden, body: `{"error":"Access denied."}`},
 		{name: "other forbidden", status: http.StatusForbidden, body: `{"error":"model access denied"}`},
 		{name: "quota forbidden", status: http.StatusForbidden, body: `{"code":"personal-team-blocked:spending-limit","error":"quota exhausted"}`},
-		{name: "unauthorized with exact text", status: http.StatusUnauthorized, body: `{"error":"Access to the chat endpoint is denied. Please update the permissions."}`},
-		{name: "rate limited with exact text", status: http.StatusTooManyRequests, body: `{"error":"Access to the chat endpoint is denied. Please update the permissions."}`},
+		{name: "unauthorized with keyword", status: http.StatusUnauthorized, body: `{"error":"Access to the chat endpoint is denied"}`},
+		{name: "rate limited with keyword", status: http.StatusTooManyRequests, body: `{"error":"Access to the chat endpoint is denied"}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -699,7 +701,7 @@ func TestUnauthorizedRetryRerendersForDifferentAccountDescriptor(t *testing.T) {
 	}
 }
 
-func TestExactChatDenialDeletesOnlyMatchingScope(t *testing.T) {
+func TestChatDenialKeywordDeletesOnlyMatchingScope(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
@@ -707,7 +709,8 @@ func TestExactChatDenialDeletesOnlyMatchingScope(t *testing.T) {
 			t.Errorf("authorization = %q", got)
 		}
 		writeJSONResponse(t, w, http.StatusForbidden, map[string]any{
-			"status_code": float64(403), "error": permanentChatDenialMessage,
+			"status_code": float64(403),
+			"error":       permanentChatDenialKeyword + ". Please ensure you're using the correct credentials. Contact support.",
 		})
 	}))
 	defer upstream.Close()
@@ -788,11 +791,11 @@ func TestExactChatDenialDeletesOnlyMatchingScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := client.DoInference(context.Background(), plan, InferenceOptions{}); err == nil {
-		t.Fatal("exact denial unexpectedly succeeded")
+		t.Fatal("keyword denial unexpectedly succeeded")
 	} else {
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) || !isPermanentAccountDenial(apiErr) {
-			t.Fatalf("error = %#v, want exact denial", err)
+			t.Fatalf("error = %#v, want keyword denial", err)
 		}
 	}
 	if calls.Load() != 1 {

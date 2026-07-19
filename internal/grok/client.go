@@ -31,7 +31,7 @@ import (
 
 const quotaErrorCode = "personal-team-blocked:spending-limit"
 
-const permanentChatDenialMessage = "Access to the chat endpoint is denied. Please update the permissions."
+const permanentChatDenialKeyword = "Access to the chat endpoint is denied"
 
 const permanentChatDenialReason = "chat_endpoint_denied"
 
@@ -902,7 +902,11 @@ func isAuthError(err *APIError) bool {
 }
 
 func isPermanentAccountDenial(err *APIError) bool {
-	return err != nil && err.Status == http.StatusForbidden && err.UpstreamMessage == permanentChatDenialMessage
+	if err == nil || err.Status != http.StatusForbidden {
+		return false
+	}
+	return strings.Contains(err.UpstreamMessage, permanentChatDenialKeyword) ||
+		strings.Contains(err.Body, permanentChatDenialKeyword)
 }
 
 // deletePermanentlyDeniedCredential removes the exact logical credential

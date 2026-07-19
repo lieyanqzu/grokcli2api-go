@@ -104,6 +104,7 @@ type account struct {
 	modelCooldowns map[string]cooldownState
 	disabled       bool
 	disableReason  string
+	deleting       bool
 	refreshOnce    sync.Once
 	refreshLock    chan struct{}
 	generation     atomic.Uint64
@@ -1026,6 +1027,18 @@ func (p *Pool) ImportCredentials(ctx context.Context, raw []byte) ([]CredentialI
 		delete(p.files, path)
 		p.mu.Unlock()
 	}
+	// An explicit administrator import is the only in-process operation allowed
+	// to cancel a previous failed-delete tombstone. The normal scan path keeps
+	// deleting accounts fail-closed so a concurrent refresh cannot revive one.
+	p.mu.RLock()
+	for _, id := range ids {
+		if existing := p.accounts[id]; existing != nil {
+			existing.mu.Lock()
+			existing.deleting = false
+			existing.mu.Unlock()
+		}
+	}
+	p.mu.RUnlock()
 	stateChanged, err := p.scanUnlocked()
 	if err != nil {
 		return nil, err
@@ -1108,8 +1121,10 @@ func mergeImportedCredential(root map[string]any, imported, existing *credential
 	return nil
 }
 
-// DeleteCredential removes every valid file for an account and immediately
-// evicts that account from scheduling. Existing leases retain their snapshots.
+// DeleteCredential removes every valid file for an account. The account is
+// marked as deleting before any cross-process file-lock wait, making the
+// operation fail-closed for new leases and concurrent refreshes. Existing
+// leases retain their snapshots.
 func (p *Pool) DeleteCredential(ctx context.Context, id string) error {
 	p.mutationMu.Lock()
 	defer p.mutationMu.Unlock()
@@ -1119,10 +1134,15 @@ func (p *Pool) DeleteCredential(ctx context.Context, id string) error {
 	if a == nil {
 		return ErrCredentialNotFound
 	}
+	p.markAccountDeleting(a, id)
 	if err := a.acquireRefresh(ctx); err != nil {
 		return err
 	}
 	defer a.releaseRefresh()
+	// A refresh which already held refreshLock when deletion began may have
+	// completed immediately before this acquisition. Reassert the terminal
+	// state while holding the same lock used by refreshCredential.
+	p.markAccountDeleting(a, id)
 
 	entries, err := os.ReadDir(p.cfg.Dir)
 	if err != nil {
@@ -1209,6 +1229,31 @@ func (p *Pool) DeleteCredential(ctx context.Context, id string) error {
 		return err
 	}
 	return p.persistState()
+}
+
+func (p *Pool) markAccountDeleting(a *account, id string) {
+	if a == nil || id == "" {
+		return
+	}
+	a.mu.Lock()
+	fingerprint := credentialFingerprint(a.credential)
+	a.deleting = true
+	a.disabled = true
+	a.disableReason = "removed"
+	a.generation.Add(1)
+	a.mu.Unlock()
+	p.mu.Lock()
+	state := p.states[id]
+	state.Disabled = true
+	state.Reason = "removed"
+	state.CredentialFingerprint = fingerprint
+	p.states[id] = state
+	p.mu.Unlock()
+	p.rebuildActive()
+	p.notifyCapacity()
+	if err := p.persistState(); err != nil {
+		slog.Error("credential deleting state persistence failed", "account", id, "error", err)
+	}
 }
 
 func removeLogicalCredential(root map[string]any, credential *credential) {
@@ -1916,6 +1961,10 @@ func (p *Pool) refreshCredential(ctx context.Context, a *account, force bool, ob
 	p.mu.RUnlock()
 	next = credentialWithProvisionalModels(next, catalog)
 	a.mu.Lock()
+	if a.deleting {
+		a.mu.Unlock()
+		return ErrNoAuth
+	}
 	a.credential = next
 	a.generation.Add(1)
 	a.disabled = false
@@ -2172,19 +2221,21 @@ func (p *Pool) scanUnlocked() (bool, error) {
 			if credentialChanged {
 				existing.generation.Add(1)
 				poolChanged = true
-				existing.disabled = false
-				existing.disableReason = ""
-				existing.cooldownUntil = time.Time{}
-				existing.cooldownCause = ""
-				state := p.states[id]
-				state.Disabled = false
-				state.CredentialFingerprint = ""
-				state.CooldownUntil = time.Time{}
-				state.Reason = ""
-				if len(state.ModelCooldowns) == 0 {
-					delete(p.states, id)
-				} else {
-					p.states[id] = state
+				if !existing.deleting {
+					existing.disabled = false
+					existing.disableReason = ""
+					existing.cooldownUntil = time.Time{}
+					existing.cooldownCause = ""
+					state := p.states[id]
+					state.Disabled = false
+					state.CredentialFingerprint = ""
+					state.CooldownUntil = time.Time{}
+					state.Reason = ""
+					if len(state.ModelCooldowns) == 0 {
+						delete(p.states, id)
+					} else {
+						p.states[id] = state
+					}
 				}
 			}
 			existing.mu.Unlock()

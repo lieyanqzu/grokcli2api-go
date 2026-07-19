@@ -137,6 +137,12 @@ func TestDeleteCredentialRechecksScopeAfterWaitingForFileLock(t *testing.T) {
 	if len(target.refreshLock) != 0 {
 		t.Fatal("delete did not acquire the target account lock")
 	}
+	if lease, acquireErr := pool.AcquireAccount(context.Background(), targetID); !errors.Is(acquireErr, ErrNoAuth) {
+		if lease != nil {
+			lease.Release()
+		}
+		t.Fatalf("account remained schedulable while delete waited for the file lock: %v", acquireErr)
+	}
 	select {
 	case deleteErr := <-done:
 		t.Fatalf("delete returned before the held auth file lock was released: %v", deleteErr)
@@ -165,12 +171,112 @@ func TestDeleteCredentialRechecksScopeAfterWaitingForFileLock(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("delete did not finish after the auth file lock was released")
 	}
+	if lease, acquireErr := pool.AcquireAccount(context.Background(), targetID); !errors.Is(acquireErr, ErrNoAuth) {
+		if lease != nil {
+			lease.Release()
+		}
+		t.Fatalf("failed delete revived the old logical account: %v", acquireErr)
+	}
 
 	var disk map[string]any
 	readJSONFile(t, path, &disk)
 	replacement, _ := disk["scope:team"].(map[string]any)
 	if replacement["principal_id"] != "new-principal" || replacement["key"] != "new-token" {
 		t.Fatalf("replacement credential was deleted or rewritten: %#v", disk)
+	}
+}
+
+func TestDeleteCredentialCannotBeRevivedByConcurrentRefresh(t *testing.T) {
+	refreshEntered := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseRefresh)
+		}
+	}()
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(refreshEntered)
+		select {
+		case <-releaseRefresh:
+		case <-r.Context().Done():
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "token-refreshed", "refresh_token": "refresh-refreshed", "expires_in": 3600,
+		})
+	}))
+	defer tokenServer.Close()
+
+	dir := t.TempDir()
+	path := writeTestCredential(t, dir, "auth.json", "refresh-delete", "token-old", time.Now().Add(time.Hour), tokenServer.URL)
+	pool, err := NewPool(context.Background(), PoolConfig{
+		Dir: dir, Surface: "headless", ReloadInterval: time.Hour, RefreshConcurrency: 1, AllowEmpty: true,
+	}, tokenServer.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	accountID := pool.AccountIDs()[0]
+	pool.mu.RLock()
+	target := pool.accounts[accountID]
+	pool.mu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	refreshDone := make(chan error, 1)
+	go func() { refreshDone <- pool.Refresh(ctx, accountID) }()
+	select {
+	case <-refreshEntered:
+	case <-ctx.Done():
+		t.Fatal("refresh did not reach the token endpoint")
+	}
+	deleteDone := make(chan error, 1)
+	go func() { deleteDone <- pool.DeleteCredential(ctx, accountID) }()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		target.mu.RLock()
+		deleting := target.deleting
+		target.mu.RUnlock()
+		if deleting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("delete did not mark the account before waiting for refresh")
+		}
+		runtime.Gosched()
+	}
+	if lease, acquireErr := pool.AcquireAccount(context.Background(), accountID); !errors.Is(acquireErr, ErrNoAuth) {
+		if lease != nil {
+			lease.Release()
+		}
+		t.Fatalf("deleting account remained schedulable: %v", acquireErr)
+	}
+
+	close(releaseRefresh)
+	released = true
+	select {
+	case refreshErr := <-refreshDone:
+		if !errors.Is(refreshErr, ErrNoAuth) {
+			t.Fatalf("concurrent refresh error = %v, want ErrNoAuth", refreshErr)
+		}
+	case <-ctx.Done():
+		t.Fatal("refresh did not finish")
+	}
+	select {
+	case deleteErr := <-deleteDone:
+		if deleteErr != nil {
+			t.Fatalf("delete error = %v", deleteErr)
+		}
+	case <-ctx.Done():
+		t.Fatal("delete did not finish")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("refreshed credential was recreated after deletion: %v", err)
+	}
+	if len(pool.AccountIDs()) != 0 {
+		t.Fatalf("deleted account returned to pool: %v", pool.AccountIDs())
 	}
 }
 
