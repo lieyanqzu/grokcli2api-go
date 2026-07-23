@@ -26,6 +26,13 @@ const affinityStateFileName = ".grokcli2api-affinity.json"
 
 var errAccountBusy = errors.New("credential account is at its in-flight limit")
 
+// maxConsecutiveRefreshFailures is how many times an account may fail OAuth
+// refresh in a row before it is permanently disabled instead of being cooled.
+// A successful refresh (or even a permanent error from the IdP) resets the
+// counter, so only accounts that reliably time out or return transient errors
+// are removed.
+const maxConsecutiveRefreshFailures = 3
+
 var ErrCredentialNotFound = errors.New("credential not found")
 
 type AffinityMode uint8
@@ -108,6 +115,7 @@ type account struct {
 	refreshOnce    sync.Once
 	refreshLock    chan struct{}
 	generation     atomic.Uint64
+	refreshFails   atomic.Int64
 	inflight       atomic.Int64
 }
 
@@ -2006,12 +2014,14 @@ func (p *Pool) refreshCredential(ctx context.Context, a *account, force bool, ob
 		}
 		var refreshErr *RefreshError
 		permanent := errors.As(err, &refreshErr) && refreshErr.Permanent
+		failures := a.refreshFails.Add(1)
 		attrs := []any{
 			"account", a.id,
 			"auth_mode", string(cred.AuthMode),
 			"scope", cred.Scope,
 			"has_refresh_token", cred.RefreshToken != "",
 			"force", force,
+			"consecutive_failures", failures,
 			"error", err.Error(),
 		}
 		if !cred.ExpiresAt.IsZero() {
@@ -2023,12 +2033,20 @@ func (p *Pool) refreshCredential(ctx context.Context, a *account, force bool, ob
 		if permanent {
 			slog.Warn("credential refresh permanently failed", attrs...)
 			p.Disable(a.id, "refresh_invalid")
+		} else if failures >= maxConsecutiveRefreshFailures {
+			slog.Warn("credential refresh exhausted after consecutive failures, disabling account", attrs...)
+			p.Disable(a.id, "refresh_exhausted")
 		} else {
+			backoff := time.Duration(1<<(failures-1)) * time.Minute
+			if backoff > 10*time.Minute {
+				backoff = 10 * time.Minute
+			}
 			slog.Warn("credential refresh failed, cooling account", attrs...)
-			p.MarkCooldown(a.id, "refresh_backoff", time.Minute)
+			p.MarkCooldown(a.id, "refresh_backoff", backoff)
 		}
 		return err
 	}
+	a.refreshFails.Store(0)
 	p.mu.RLock()
 	catalog := p.catalogs[a.id]
 	p.mu.RUnlock()
