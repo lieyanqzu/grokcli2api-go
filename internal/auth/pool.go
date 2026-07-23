@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -30,8 +31,9 @@ var errAccountBusy = errors.New("credential account is at its in-flight limit")
 // refresh in a row before it is permanently disabled instead of being cooled.
 // A successful refresh (or even a permanent error from the IdP) resets the
 // counter, so only accounts that reliably time out or return transient errors
-// are removed.
-const maxConsecutiveRefreshFailures = 3
+// are removed. The cooldown schedule grows geometrically (36m, 108m, 324m,
+// 972m) so that the total wait across all attempts sums to exactly 24 hours.
+const maxConsecutiveRefreshFailures = 5
 
 var ErrCredentialNotFound = errors.New("credential not found")
 
@@ -2037,9 +2039,10 @@ func (p *Pool) refreshCredential(ctx context.Context, a *account, force bool, ob
 			slog.Warn("credential refresh exhausted after consecutive failures, disabling account", attrs...)
 			p.Disable(a.id, "refresh_exhausted")
 		} else {
-			backoff := time.Duration(1<<(failures-1)) * time.Minute
-			if backoff > 10*time.Minute {
-				backoff = 10 * time.Minute
+			// Geometric backoff: 36m, 108m, 324m, 972m — sum = 1440m = 24h.
+			backoff := time.Duration(36*math.Pow(3, float64(failures-1))) * time.Minute
+			if backoff > 24*time.Hour {
+				backoff = 24 * time.Hour
 			}
 			slog.Warn("credential refresh failed, cooling account", attrs...)
 			p.MarkCooldown(a.id, "refresh_backoff", backoff)
