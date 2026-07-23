@@ -752,11 +752,8 @@ func (s *Server) writeClientError(w http.ResponseWriter, err error) {
 	}
 	var upstream *grok.APIError
 	if errors.As(err, &upstream) {
-		status := upstream.Status
-		if status < 400 || status > 599 {
-			status = http.StatusBadGateway
-		}
-		setRetryAfter(w, upstream.RetryAfter)
+		status, retryAfter := clientFacingUpstreamStatus(upstream)
+		setRetryAfter(w, retryAfter)
 		writeJSON(w, status, upstreamError(upstream))
 		return
 	}
@@ -789,11 +786,8 @@ func (s *Server) writeAnthropicClientError(w http.ResponseWriter, err error) {
 	}
 	var upstream *grok.APIError
 	if errors.As(err, &upstream) {
-		status := upstream.Status
-		if status < 400 || status > 599 {
-			status = http.StatusBadGateway
-		}
-		setRetryAfter(w, upstream.RetryAfter)
+		status, retryAfter := clientFacingUpstreamStatus(upstream)
+		setRetryAfter(w, retryAfter)
 		kind := anthropicErrorType(status)
 		message := upstream.UpstreamMessage
 		if message == "" {
@@ -832,13 +826,37 @@ func clientErrorPayload(err error) map[string]any {
 	return openai.Error(err.Error(), typeName, code)
 }
 
+// clientFacingUpstreamStatus remaps upstream account-pool failures that
+// clients should treat as transient. 402/403 from a depleted or denied
+// credential are returned as 429 so downstream auto-retry logic kicks in
+// after this proxy has already switched or removed the bad account.
+func clientFacingUpstreamStatus(e *grok.APIError) (status int, retryAfter time.Duration) {
+	if e == nil {
+		return http.StatusBadGateway, 0
+	}
+	status = e.Status
+	if status < 400 || status > 599 {
+		status = http.StatusBadGateway
+	}
+	retryAfter = e.RetryAfter
+	switch e.Status {
+	case http.StatusPaymentRequired, http.StatusForbidden:
+		status = http.StatusTooManyRequests
+		if retryAfter <= 0 {
+			retryAfter = time.Second
+		}
+	}
+	return status, retryAfter
+}
+
 func upstreamError(e *grok.APIError) map[string]any {
+	status, _ := clientFacingUpstreamStatus(e)
 	kind := "invalid_request_error"
-	if e.Status == http.StatusTooManyRequests {
+	if status == http.StatusTooManyRequests {
 		kind = "rate_limit_error"
-	} else if e.Status == http.StatusUnauthorized || e.Status == http.StatusForbidden {
+	} else if status == http.StatusUnauthorized {
 		kind = "authentication_error"
-	} else if e.Status >= 500 {
+	} else if status >= 500 {
 		kind = "upstream_error"
 	}
 	code := e.UpstreamCode

@@ -414,8 +414,8 @@ func TestChatDenialKeywordDeletesOnlyAccount(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		return rec.Code
 	}
-	if status := request(); status != http.StatusForbidden {
-		t.Fatalf("first status=%d, want 403", status)
+	if status := request(); status != http.StatusTooManyRequests {
+		t.Fatalf("first status=%d, want 429", status)
 	}
 	if status := request(); status != http.StatusServiceUnavailable {
 		t.Fatalf("second status=%d, want 503", status)
