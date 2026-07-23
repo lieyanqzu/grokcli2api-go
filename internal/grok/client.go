@@ -35,6 +35,8 @@ const permanentChatDenialKeyword = "Access to the chat endpoint is denied"
 
 const permanentChatDenialReason = "chat_endpoint_denied"
 
+const quotaExhaustedReason = "quota_exhausted"
+
 const freeModelQuotaMessage = "used all the included free usage for model"
 
 const freeModelQuotaReason = "model_free_quota_exhausted"
@@ -389,8 +391,8 @@ func (c *Client) fetchAccountModelsPath(ctx context.Context, accountID string, r
 	}
 	if resp.StatusCode >= 400 {
 		apiErr := parseAPIError(resp, payload)
-		if isPermanentAccountDenial(apiErr) {
-			c.deletePermanentlyDeniedCredential(accountID)
+		if reason := permanentRemovalReason(apiErr); reason != "" {
+			deleteCredentialOrDisable(c.pool, accountID, reason)
 			return modelFetchResult{}, apiErr
 		}
 		if isAuthError(apiErr) && !refreshed && c.pool.Refresh(ctx, accountID) == nil {
@@ -553,8 +555,8 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 		}
 		timing.MarkAcquire(time.Since(acquireStarted))
 		if err != nil {
-			var permanentDenial *APIError
-			if errors.As(lastErr, &permanentDenial) && isPermanentAccountDenial(permanentDenial) {
+			var denied *APIError
+			if errors.As(lastErr, &denied) && permanentRemovalReason(denied) != "" {
 				return nil, lastErr
 			}
 			var unavailable *auth.UnavailableError
@@ -572,6 +574,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 		used[accountID] = struct{}{}
 		resp, wrote, err := c.doWithIdentity(ctx, lease, method, path, payload, identity, trace, false, nil)
 		if err != nil {
+			logUpstreamAttempt(accountID, model, len(used), 0, "transport")
 			lease.Release()
 			lastErr = err
 			if ctx.Err() != nil || wrote || len(used) >= c.cfg.RetryMaxAttempts {
@@ -591,10 +594,15 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 		}
 		if resp.StatusCode >= 400 {
 			apiErr := parseAPIError(resp, data)
+			summary := apiErr.UpstreamCode
+			if summary == "" {
+				summary = http.StatusText(resp.StatusCode)
+			}
+			logUpstreamAttempt(accountID, model, len(used), resp.StatusCode, summary)
 			lease.Release()
 			lastErr = apiErr
-			if isPermanentAccountDenial(apiErr) {
-				c.deletePermanentlyDeniedCredential(accountID)
+			if reason := permanentRemovalReason(apiErr); reason != "" {
+				deleteCredentialOrDisable(c.pool, accountID, reason)
 				if len(used) < c.cfg.RetryMaxAttempts {
 					continue
 				}
@@ -635,6 +643,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body map[strin
 			}
 			continue
 		}
+		logUpstreamAttempt(accountID, model, len(used), resp.StatusCode, "")
 		lease.Release()
 		return c.decodeSuccess(data, affinity, model, accountID)
 	}
@@ -682,8 +691,8 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 		}
 		timing.MarkAcquire(time.Since(acquireStarted))
 		if err != nil {
-			var permanentDenial *APIError
-			if errors.As(lastErr, &permanentDenial) && isPermanentAccountDenial(permanentDenial) {
+			var denied *APIError
+			if errors.As(lastErr, &denied) && permanentRemovalReason(denied) != "" {
 				return nil, lastErr
 			}
 			var unavailable *auth.UnavailableError
@@ -701,6 +710,7 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 		used[accountID] = struct{}{}
 		resp, wrote, err := c.doWithIdentity(ctx, lease, http.MethodPost, path, payload, identity, trace, true, nil)
 		if err != nil {
+			logUpstreamAttempt(accountID, model, len(used), 0, "transport")
 			lease.Release()
 			lastErr = err
 			if ctx.Err() != nil || wrote || len(used) >= c.cfg.RetryMaxAttempts {
@@ -720,9 +730,14 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 				return nil, readErr
 			}
 			apiErr := parseAPIError(resp, data)
+			summary := apiErr.UpstreamCode
+			if summary == "" {
+				summary = http.StatusText(resp.StatusCode)
+			}
+			logUpstreamAttempt(accountID, model, len(used), resp.StatusCode, summary)
 			lastErr = apiErr
-			if isPermanentAccountDenial(apiErr) {
-				c.deletePermanentlyDeniedCredential(accountID)
+			if reason := permanentRemovalReason(apiErr); reason != "" {
+				deleteCredentialOrDisable(c.pool, accountID, reason)
 				if len(used) < c.cfg.RetryMaxAttempts {
 					continue
 				}
@@ -764,6 +779,7 @@ func (c *Client) OpenStream(ctx context.Context, path string, body map[string]an
 			}
 			continue
 		}
+		logUpstreamAttempt(accountID, model, len(used), resp.StatusCode, "")
 		c.pool.Bind(affinity, model, accountID)
 		if err := decodeResponseBody(resp); err != nil {
 			resp.Body.Close()
@@ -858,16 +874,37 @@ func (c *Client) doWithIdentity(ctx context.Context, lease *auth.Lease, method, 
 	return resp, wrote.Load(), nil
 }
 
+// logUpstreamAttempt emits a compact log line for each upstream HTTP attempt so
+// the retry chain is visible in production logs. Transport errors use status 0.
+func logUpstreamAttempt(accountID, model string, attempt, status int, summary string) {
+	short := accountID
+	if len(short) > 12 {
+		short = short[:12]
+	}
+	attrs := []any{"account", short, "attempt", attempt}
+	if model != "" {
+		attrs = append(attrs, "model", model)
+	}
+	attrs = append(attrs, "status", status)
+	if summary != "" {
+		attrs = append(attrs, "summary", summary)
+	}
+	switch {
+	case status == 0 || status >= 500:
+		slog.Warn("upstream request failed", attrs...)
+	case status >= 400:
+		slog.Warn("upstream request failed", attrs...)
+	default:
+		slog.Info("upstream request ok", attrs...)
+	}
+}
+
 func (c *Client) handleRetryable(accountID, model string, err *APIError) bool {
 	if err.ShouldRetry != nil && !*err.ShouldRetry {
 		return false
 	}
 	if isFreeModelQuotaExhausted(err) {
 		c.pool.MarkModelCooldown(accountID, model, freeModelQuotaReason, c.cfg.QuotaCooldown)
-		return true
-	}
-	if strings.EqualFold(err.UpstreamCode, quotaErrorCode) {
-		c.pool.MarkCooldown(accountID, "quota_exhausted", c.cfg.QuotaCooldown)
 		return true
 	}
 	if err.Status == http.StatusTooManyRequests {
@@ -909,20 +946,46 @@ func isPermanentAccountDenial(err *APIError) bool {
 		strings.Contains(err.Body, permanentChatDenialKeyword)
 }
 
-// deletePermanentlyDeniedCredential removes the exact logical credential
-// rejected by the upstream. DeleteCredential is scope-aware, so a denial for
-// one scope in a multi-scope auth.json does not remove its siblings. A failed
-// filesystem deletion falls back to disabling the account so it cannot be
-// scheduled again while the operator investigates the write/lock failure.
-func (c *Client) deletePermanentlyDeniedCredential(accountID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := c.pool.DeleteCredential(ctx, accountID); err != nil && !errors.Is(err, auth.ErrCredentialNotFound) {
-		c.pool.Disable(accountID, permanentChatDenialReason)
-		slog.Error("delete credential after exact chat endpoint denial failed", "account", accountID, "error", err)
+func isAccountQuotaExhausted(err *APIError) bool {
+	if err == nil {
+		return false
+	}
+	return err.Status == http.StatusPaymentRequired || strings.EqualFold(err.UpstreamCode, quotaErrorCode)
+}
+
+// permanentRemovalReason returns the disable/delete reason when an upstream
+// error means this credential should never be scheduled again. Empty means the
+// error is not a permanent account removal.
+func permanentRemovalReason(err *APIError) string {
+	if isAccountQuotaExhausted(err) {
+		return quotaExhaustedReason
+	}
+	if isPermanentAccountDenial(err) {
+		return permanentChatDenialReason
+	}
+	return ""
+}
+
+// deleteCredentialOrDisable removes the exact logical credential rejected by
+// the upstream. DeleteCredential is scope-aware, so a denial for one scope in
+// a multi-scope auth.json does not remove its siblings. A failed filesystem
+// deletion falls back to disabling the account so it cannot be scheduled again
+// while the operator investigates the write/lock failure.
+func deleteCredentialOrDisable(pool *auth.Pool, accountID, reason string) {
+	if pool == nil || accountID == "" {
 		return
 	}
-	slog.Warn("credential deleted after exact chat endpoint denial", "account", accountID)
+	if reason == "" {
+		reason = permanentChatDenialReason
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := pool.DeleteCredential(ctx, accountID); err != nil && !errors.Is(err, auth.ErrCredentialNotFound) {
+		pool.Disable(accountID, reason)
+		slog.Error("delete credential failed", "account", accountID, "reason", reason, "error", err)
+		return
+	}
+	slog.Warn("credential deleted", "account", accountID, "reason", reason)
 }
 
 func isFreeModelQuotaExhausted(err *APIError) bool {
@@ -1075,9 +1138,7 @@ func (s *EventStream) observe(data []byte) {
 		code = stringField(inner, "code")
 	}
 	if strings.EqualFold(code, quotaErrorCode) {
-		if s.pool != nil {
-			s.pool.MarkCooldown(s.accountID, "quota_exhausted", s.quotaCooldown)
-		}
+		deleteCredentialOrDisable(s.pool, s.accountID, quotaExhaustedReason)
 		return
 	}
 	if isFreeModelQuotaExhausted(&APIError{Status: http.StatusTooManyRequests, Body: string(data)}) {

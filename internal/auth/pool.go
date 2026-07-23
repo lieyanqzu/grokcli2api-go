@@ -1699,6 +1699,8 @@ func (p *Pool) MarkCooldown(accountID, reason string, duration time.Duration) {
 	now := time.Now()
 	until := now.Add(duration)
 	a.mu.Lock()
+	previousReason := a.cooldownCause
+	previousUntil := a.cooldownUntil
 	remaining := time.Until(a.cooldownUntil)
 	extensionThreshold := remaining / 10
 	if extensionThreshold < 5*time.Second {
@@ -1710,6 +1712,16 @@ func (p *Pool) MarkCooldown(accountID, reason string, duration time.Duration) {
 	} else {
 		until = a.cooldownUntil
 		reason = a.cooldownCause
+	}
+	authMode := ""
+	scope := ""
+	hasRefreshToken := false
+	expiresAt := time.Time{}
+	if a.credential != nil {
+		authMode = string(a.credential.AuthMode)
+		scope = a.credential.Scope
+		hasRefreshToken = a.credential.RefreshToken != ""
+		expiresAt = a.credential.ExpiresAt
 	}
 	a.mu.Unlock()
 	if !changed {
@@ -1723,7 +1735,26 @@ func (p *Pool) MarkCooldown(accountID, reason string, duration time.Duration) {
 	p.requestRebuild()
 	p.rebuildWhenCooldownExpires(until)
 	_ = p.persistState()
-	slog.Warn("credential account cooling", "account", accountID, "reason", reason, "until", until.UTC().Format(time.RFC3339))
+	attrs := []any{
+		"account", accountID,
+		"reason", reason,
+		"duration", duration.String(),
+		"until", until.UTC().Format(time.RFC3339),
+		"remaining", time.Until(until).Round(time.Second).String(),
+		"auth_mode", authMode,
+		"scope", scope,
+		"has_refresh_token", hasRefreshToken,
+	}
+	if !expiresAt.IsZero() {
+		attrs = append(attrs, "token_expires_at", expiresAt.UTC().Format(time.RFC3339))
+	}
+	if previousReason != "" && now.Before(previousUntil) {
+		attrs = append(attrs,
+			"previous_reason", previousReason,
+			"previous_until", previousUntil.UTC().Format(time.RFC3339),
+		)
+	}
+	slog.Warn("credential account cooling", attrs...)
 }
 
 func (p *Pool) MarkModelCooldown(accountID, model, reason string, duration time.Duration) {
@@ -1773,7 +1804,14 @@ func (p *Pool) MarkModelCooldown(accountID, model, reason string, duration time.
 	if err := p.persistState(); err != nil {
 		slog.Error("credential scheduler state persistence failed", "error", err)
 	}
-	slog.Warn("credential model cooling", "account", accountID, "model", model, "reason", reason, "until", until.UTC().Format(time.RFC3339))
+	slog.Warn("credential model cooling",
+		"account", accountID,
+		"model", model,
+		"reason", reason,
+		"duration", duration.String(),
+		"until", until.UTC().Format(time.RFC3339),
+		"remaining", time.Until(until).Round(time.Second).String(),
+	)
 }
 
 func cloneModelCooldowns(source map[string]cooldownState) map[string]cooldownState {
@@ -1824,7 +1862,25 @@ func (p *Pool) Disable(accountID, reason string) {
 	if err := p.persistState(); err != nil {
 		slog.Error("credential scheduler state persistence failed", "error", err)
 	}
-	slog.Warn("credential account disabled", "account", accountID, "reason", reason)
+	authMode := ""
+	scope := ""
+	hasRefreshToken := false
+	if a != nil {
+		a.mu.RLock()
+		if a.credential != nil {
+			authMode = string(a.credential.AuthMode)
+			scope = a.credential.Scope
+			hasRefreshToken = a.credential.RefreshToken != ""
+		}
+		a.mu.RUnlock()
+	}
+	slog.Warn("credential account disabled",
+		"account", accountID,
+		"reason", reason,
+		"auth_mode", authMode,
+		"scope", scope,
+		"has_refresh_token", hasRefreshToken,
+	)
 }
 
 func credentialFingerprint(cred *credential) string {
@@ -1949,9 +2005,26 @@ func (p *Pool) refreshCredential(ctx context.Context, a *account, force bool, ob
 			return err
 		}
 		var refreshErr *RefreshError
-		if errors.As(err, &refreshErr) && refreshErr.Permanent {
+		permanent := errors.As(err, &refreshErr) && refreshErr.Permanent
+		attrs := []any{
+			"account", a.id,
+			"auth_mode", string(cred.AuthMode),
+			"scope", cred.Scope,
+			"has_refresh_token", cred.RefreshToken != "",
+			"force", force,
+			"error", err.Error(),
+		}
+		if !cred.ExpiresAt.IsZero() {
+			attrs = append(attrs, "token_expires_at", cred.ExpiresAt.UTC().Format(time.RFC3339))
+		}
+		if refreshErr != nil {
+			attrs = append(attrs, "refresh_status", refreshErr.Status, "refresh_code", refreshErr.Code, "permanent", refreshErr.Permanent)
+		}
+		if permanent {
+			slog.Warn("credential refresh permanently failed", attrs...)
 			p.Disable(a.id, "refresh_invalid")
 		} else {
+			slog.Warn("credential refresh failed, cooling account", attrs...)
 			p.MarkCooldown(a.id, "refresh_backoff", time.Minute)
 		}
 		return err

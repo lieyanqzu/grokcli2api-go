@@ -120,6 +120,34 @@ func TestFreeModelQuotaDetection(t *testing.T) {
 	}
 }
 
+func TestAccountQuotaExhaustionDetection(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{
+			name:   "payment required",
+			status: http.StatusPaymentRequired,
+			body:   `{"error":"You have run out of credits or need a Grok subscription. Add credits at https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok."}`,
+			want:   true,
+		},
+		{name: "legacy spending limit", status: http.StatusForbidden, body: `{"code":"personal-team-blocked:spending-limit","error":"quota exhausted"}`, want: true},
+		{name: "unrelated forbidden", status: http.StatusForbidden, body: `{"error":"model access denied"}`},
+		{name: "unrelated bad request", status: http.StatusBadRequest, body: `{"error":"invalid request"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := &http.Response{StatusCode: test.status, Header: http.Header{}}
+			apiErr := parseAPIError(response, []byte(test.body))
+			if got := isAccountQuotaExhausted(apiErr); got != test.want {
+				t.Fatalf("isAccountQuotaExhausted() = %v, want %v; error=%#v", got, test.want, apiErr)
+			}
+		})
+	}
+}
+
 func TestRefreshModelsDiscoversEveryAccountAndPersistsCatalogsInState(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

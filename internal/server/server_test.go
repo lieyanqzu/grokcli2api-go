@@ -243,6 +243,84 @@ func TestQuotaErrorSwitchesAccount(t *testing.T) {
 	}
 }
 
+func TestPaymentRequiredSwitchesAccount(t *testing.T) {
+	var mu sync.Mutex
+	var tokens []string
+	depletedToken := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		tokens = append(tokens, token)
+		if depletedToken == "" {
+			depletedToken = token
+		}
+		depleted := token == depletedToken
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if depleted {
+			w.Header().Set("X-Should-Retry", "false")
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = io.WriteString(w, `{"error":"You have run out of credits or need a Grok subscription. Add credits at https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok."}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-ok","choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	}))
+	defer upstream.Close()
+	h := newTestHandlerWithTokens(t, upstream.URL, nil, []string{"token-a", "token-b"})
+
+	for _, user := range []string{"session-a", "session-b"} {
+		rec := httptest.NewRecorder()
+		body := fmt.Sprintf(`{"model":"grok-4","messages":[{"role":"user","content":"hi"}],"user":%q}`, user)
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("user=%s status=%d body=%s", user, rec.Code, rec.Body.String())
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tokens) != 3 || tokens[0] == tokens[1] || tokens[2] != tokens[1] {
+		t.Fatalf("payment-required account was scheduled again: %v", tokens)
+	}
+}
+
+func TestPaymentRequiredSwitchesAccountForStream(t *testing.T) {
+	var mu sync.Mutex
+	var tokens []string
+	depletedToken := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		tokens = append(tokens, token)
+		if depletedToken == "" {
+			depletedToken = token
+		}
+		depleted := token == depletedToken
+		mu.Unlock()
+		if depleted {
+			w.Header().Set("X-Should-Retry", "false")
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = io.WriteString(w, `{"error":"You have run out of credits or need a Grok subscription. Add credits at https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok."}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	h := newTestHandlerWithTokens(t, upstream.URL, nil, []string{"token-a", "token-b"})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"grok-4","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"content":"ok"`) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tokens) != 2 || tokens[0] == tokens[1] {
+		t.Fatalf("expected stream retry on a different account, got %v", tokens)
+	}
+}
+
 func TestChatDenialKeywordDeletesAccountAndRetries(t *testing.T) {
 	var mu sync.Mutex
 	var tokens []string

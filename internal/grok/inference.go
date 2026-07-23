@@ -119,6 +119,7 @@ func (c *Client) DoInference(ctx context.Context, plan *inference.RequestPlan, o
 		transportAttempts++
 		resp, wrote, requestErr := c.doWithIdentity(ctx, lease, http.MethodPost, attempt.Path, payload, attemptIdentity, attempt.Backend != modelcatalog.BackendChatCompletions, false, nil)
 		if requestErr != nil {
+			logUpstreamAttempt(accountID, plan.Model(), transportAttempts, 0, "transport")
 			lease.Release()
 			lastErr = requestErr
 			if ctx.Err() != nil || wrote || pinned || transportAttempts >= maxAttempts {
@@ -139,10 +140,15 @@ func (c *Client) DoInference(ctx context.Context, plan *inference.RequestPlan, o
 		}
 		if resp.StatusCode >= 400 {
 			apiErr := parseAPIError(resp, body)
+			summary := apiErr.UpstreamCode
+			if summary == "" {
+				summary = http.StatusText(resp.StatusCode)
+			}
+			logUpstreamAttempt(accountID, plan.Model(), transportAttempts, resp.StatusCode, summary)
 			lease.Release()
 			lastErr = apiErr
-			if isPermanentAccountDenial(apiErr) {
-				c.deletePermanentlyDeniedCredential(accountID)
+			if reason := permanentRemovalReason(apiErr); reason != "" {
+				deleteCredentialOrDisable(c.pool, accountID, reason)
 				if pinned {
 					return nil, stateUnavailableError()
 				}
@@ -172,9 +178,6 @@ func (c *Client) DoInference(ctx context.Context, plan *inference.RequestPlan, o
 				continue
 			}
 			retryable := c.handleRetryable(accountID, plan.Model(), apiErr)
-			if apiErr.ShouldRetry != nil && !*apiErr.ShouldRetry {
-				retryable = false
-			}
 			if !retryable || pinned || transportAttempts >= maxAttempts {
 				return nil, apiErr
 			}
@@ -183,6 +186,7 @@ func (c *Client) DoInference(ctx context.Context, plan *inference.RequestPlan, o
 			}
 			continue
 		}
+		logUpstreamAttempt(accountID, plan.Model(), transportAttempts, resp.StatusCode, "")
 		lease.Release()
 		output := make(map[string]any)
 		if len(body) > 0 && json.Unmarshal(body, &output) != nil {
@@ -282,6 +286,7 @@ func (c *Client) OpenInference(ctx context.Context, plan *inference.RequestPlan,
 		transportAttempts++
 		resp, wrote, requestErr := c.doWithIdentity(ctx, lease, http.MethodPost, attempt.Path, payload, attemptIdentity, attempt.Backend != modelcatalog.BackendChatCompletions, true, nil)
 		if requestErr != nil {
+			logUpstreamAttempt(accountID, plan.Model(), transportAttempts, 0, "transport")
 			lease.Release()
 			lastErr = requestErr
 			if ctx.Err() != nil || wrote || pinned || transportAttempts >= maxAttempts {
@@ -301,9 +306,14 @@ func (c *Client) OpenInference(ctx context.Context, plan *inference.RequestPlan,
 				return nil, readErr
 			}
 			apiErr := parseAPIError(resp, body)
+			summary := apiErr.UpstreamCode
+			if summary == "" {
+				summary = http.StatusText(resp.StatusCode)
+			}
+			logUpstreamAttempt(accountID, plan.Model(), transportAttempts, resp.StatusCode, summary)
 			lastErr = apiErr
-			if isPermanentAccountDenial(apiErr) {
-				c.deletePermanentlyDeniedCredential(accountID)
+			if reason := permanentRemovalReason(apiErr); reason != "" {
+				deleteCredentialOrDisable(c.pool, accountID, reason)
 				if pinned {
 					return nil, stateUnavailableError()
 				}
@@ -331,9 +341,6 @@ func (c *Client) OpenInference(ctx context.Context, plan *inference.RequestPlan,
 				continue
 			}
 			retryable := c.handleRetryable(accountID, plan.Model(), apiErr)
-			if apiErr.ShouldRetry != nil && !*apiErr.ShouldRetry {
-				retryable = false
-			}
 			if !retryable || pinned || transportAttempts >= maxAttempts {
 				return nil, apiErr
 			}
@@ -342,6 +349,7 @@ func (c *Client) OpenInference(ctx context.Context, plan *inference.RequestPlan,
 			}
 			continue
 		}
+		logUpstreamAttempt(accountID, plan.Model(), transportAttempts, resp.StatusCode, "")
 		if err := decodeResponseBody(resp); err != nil {
 			resp.Body.Close()
 			lease.Release()
